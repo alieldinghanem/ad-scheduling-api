@@ -12,10 +12,19 @@ from scheduler import (
     SchedulingEngine,
 )
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
 
 LOCAL_INPUT_FILE = "backend_input.json"
 OUTPUT_FILE = "output_schedule.json"
 DEFAULT_ONLINE_COURSES = ["REM101", "MGT101", "HUM101", "ETS401"]
+DEFAULT_LECTURE_DURATION_MINUTES = 120
+DEFAULT_SECTION_DURATION_MINUTES = 120
+SPECIAL_LECTURE_DURATIONS = {"CS214": 60, "ETS401": 60}
+SPECIAL_SECTION_DURATIONS = {"CS214": 60}
 
 
 def safe_int(value: Any, default: int = 0) -> int:
@@ -73,6 +82,15 @@ def normalize_course(raw: Dict[str, Any], force_online: bool = False) -> Dict[st
         "studentBreakdown": raw.get("studentBreakdown") if isinstance(raw.get("studentBreakdown"), list) else [],
         "instructorIds": raw.get("instructorIds") if isinstance(raw.get("instructorIds"), list) else [],
         "labType": lab_type,
+        "isArabicOnline": bool(raw.get("isArabicOnline") or force_online or code in DEFAULT_ONLINE_COURSES),
+        "lectureDurationMinutes": safe_int(
+            raw.get("lectureDurationMinutes"),
+            SPECIAL_LECTURE_DURATIONS.get(code, DEFAULT_LECTURE_DURATION_MINUTES),
+        ),
+        "sectionDurationMinutes": safe_int(
+            raw.get("sectionDurationMinutes"),
+            SPECIAL_SECTION_DURATIONS.get(code, DEFAULT_SECTION_DURATION_MINUTES),
+        ),
     }
 
 
