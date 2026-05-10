@@ -86,6 +86,7 @@ class SchedulingEngine:
 
         self.group_sizes: Dict[str, int] = {}
         self.group_details: Dict[str, dict] = {}
+        self.course_group_sizes: Dict[str, Dict[str, int]] = defaultdict(dict)
 
         self.unscheduled_reasons: List[str] = []
         self.warnings: List[str] = []
@@ -233,10 +234,7 @@ class SchedulingEngine:
         ]
 
         for course_index, (code, course) in enumerate(arabic_courses):
-            group_ids = (
-                self._target_group_ids_for_course(code, course)
-                or self._ensure_online_group_for_course(code, course)
-            )
+            group_ids = self._ensure_arabic_online_group_for_course(code, course)
 
             for group_id in group_ids:
                 day, slot = self._arabic_day_and_slot(course, course_index)
@@ -421,7 +419,6 @@ class SchedulingEngine:
 
             is_online = self._is_online_course(course)
             group_ids = self._target_group_ids_for_course(code, course)
-            section_counts_by_group: Dict[str, int] = {}
 
             if not is_online and course.get("labType") is not None and group_ids:
                 available_sections = self._available_section_placements_count(code, course)
@@ -429,23 +426,9 @@ class SchedulingEngine:
                     self.warnings.append(
                         f"No section placements available for {code}; lectures will be scheduled without sections."
                     )
-                else:
-                    section_counts = self._allocate_counts_across_keys(
-                        available_sections,
-                        {
-                            group_id: self.group_sizes[group_id]
-                            for group_id in group_ids
-                        },
-                    )
-                    section_counts_by_group = section_counts
-
-                    if available_sections < len(group_ids):
-                        self.warnings.append(
-                            f"Limited section placements for {code}: {available_sections} sections for {len(group_ids)} lecture groups."
-                        )
 
             for group_id in group_ids:
-                group_size = self.group_sizes[group_id]
+                group_size = self._course_group_size(code, group_id)
 
                 lecture_demand = {
                     "kind": "ONLINE_LECTURE" if is_online else "LECTURE",
@@ -468,7 +451,10 @@ class SchedulingEngine:
 
                 if not is_online and course.get("labType") is not None:
                     lab_type = self._normalized_lab_type(course.get("labType"))
-                    section_count = section_counts_by_group.get(group_id, 0)
+                    section_count = min(
+                        self._target_sections_count(group_size),
+                        max(1, len(self.group_details.get(group_id, {}).get("sectionIds") or [])),
+                    )
 
                     if section_count <= 0:
                         continue
@@ -637,7 +623,12 @@ class SchedulingEngine:
                 if self._has_group_time_conflict(group_id, day, slot, demand):
                     continue
 
-                if (section_id, day, slot) in self.section_busy:
+                if any(
+                    busy_section == section_id
+                    and busy_day == day
+                    and self._slots_overlap(busy_slot, slot)
+                    for busy_section, busy_day, busy_slot in self.section_busy
+                ):
                     continue
 
                 for instructor in self._least_busy_instructors(instructors):
@@ -1144,7 +1135,7 @@ class SchedulingEngine:
         if session.get("sectionId"):
             self.section_busy.add((session["sectionId"], day, slot))
 
-        for cohort_id in self.group_details.get(group_id, {}).get("cohortIds", []):
+        for cohort_id in self._cohort_ids_for_session(session):
             self.cohort_busy.add((cohort_id, day, slot))
 
         if session.get("instructorId") is not None and not session.get("isRecordedOnline"):
@@ -1246,13 +1237,14 @@ class SchedulingEngine:
                         existing.get("dayOfWeek") == day
                         and self._slots_overlap(existing.get("timeSlot"), slot)
                         and not self._sessions_can_overlap(existing, session)
+                        and self._same_group_sessions_conflict(existing, session)
                     ):
                         conflicts.append(f"Group conflict: {(group_key, *day_slot)}")
                         break
                 seen_group_sessions[group_key].append(session)
 
                 if not session.get("isRecordedOnline"):
-                    for cohort_id in self.group_details.get(session["groupId"], {}).get("cohortIds", []):
+                    for cohort_id in self._cohort_ids_for_session(session):
                         for existing in seen_cohorts[cohort_id]:
                             if (
                                 existing.get("dayOfWeek") == day
@@ -1333,10 +1325,32 @@ class SchedulingEngine:
                 for key, value in self.group_details[group_id].items()
                 if key != "cohortIds"
             }
+            sessions = self._sort_sessions(self.group_schedules.get(group_id, []))
+            section_ids = list(details.get("sectionIds") or [])
+            lectures = [
+                session
+                for session in sessions
+                if not session.get("sectionId")
+            ]
+            sections = [
+                {
+                    "sectionGroupId": section_id,
+                    "sectionLetter": section_id.replace(group_id, "", 1),
+                    "sessions": [
+                        session
+                        for session in sessions
+                        if session.get("sectionId") == section_id
+                    ],
+                }
+                for section_id in section_ids
+            ]
             result.append({
                 **details,
-                "sessions": self._sort_sessions(self.group_schedules.get(group_id, [])),
-                "totalSessions": len(self.group_schedules.get(group_id, [])),
+                "lectureGroupId": group_id,
+                "lectures": lectures,
+                "sections": sections,
+                "sessions": sessions,
+                "totalSessions": len(sessions),
             })
 
         return result
@@ -1971,6 +1985,18 @@ class SchedulingEngine:
         by_capacity = max(1, math.ceil(group_size / self.max_section_size))
         return max(self.min_sections_per_lecture_group, by_capacity)
 
+    def _course_group_size(self, course_code: str, group_id: str) -> int:
+        size = self.course_group_sizes.get(course_code, {}).get(group_id)
+        if size:
+            return size
+        return self.group_sizes.get(group_id, 0)
+
+    def _section_ids_for_group_size(self, group_id: str, group_size: int) -> List[str]:
+        return [
+            self._section_label(group_id, index)
+            for index in range(1, self._target_sections_count(group_size) + 1)
+        ]
+
     def _distribute_group_to_sections(
         self,
         group_size: int,
@@ -2264,6 +2290,8 @@ class SchedulingEngine:
         return bool(self.group_details)
 
     def _create_student_groups_from_courses(self) -> bool:
+        level_course_counts: Dict[int, Dict[str, int]] = defaultdict(dict)
+
         for code, course in self.courses.items():
             if (
                 self._is_online_course(course)
@@ -2278,44 +2306,55 @@ class SchedulingEngine:
                 self.warnings.append(f"Skipped {code} groups because totalStudentCount is 0.")
                 continue
 
-            available_lectures = self._available_lecture_placements_count(code, course)
-            if available_lectures <= 0:
-                self.blocked_courses.add(code)
-                self.unscheduled_reasons.append(self._lecture_resource_shortage_reason(code, course))
+            for level, count in level_counts.items():
+                level_course_counts[level][code] = count
+
+        for level, course_counts in sorted(level_course_counts.items()):
+            max_students = max(course_counts.values(), default=0)
+            if max_students <= 0:
                 continue
 
-            lecture_groups = min(available_lectures, total_students)
-            level_group_counts = self._allocate_counts_across_keys(
-                lecture_groups,
-                {str(level): count for level, count in level_counts.items()},
+            lecture_group_count = max(
+                1,
+                math.ceil(max_students / max(1, self.max_lecture_group_size)),
             )
+            lecture_group_sizes = self._split_evenly(max_students, lecture_group_count)
 
-            clean_code = "".join(ch for ch in code if ch.isalnum())
-            for level_text, group_count in sorted(level_group_counts.items(), key=lambda item: int(item[0])):
-                level = self._safe_int(level_text, 1)
-                level_students = level_counts.get(level, 0)
-                sizes = self._split_evenly(level_students, group_count)
+            for group_index, group_size in enumerate(lecture_group_sizes, start=1):
+                group_id = f"L{level}G{group_index}"
+                section_ids = self._section_ids_for_group_size(group_id, group_size)
 
-                for index, size in enumerate(sizes, start=1):
+                self.group_sizes[group_id] = group_size
+                self.group_details[group_id] = {
+                    "groupId": group_id,
+                    "level": level,
+                    "studentCount": group_size,
+                    "department": None,
+                    "departments": [],
+                    "courseCodes": [],
+                    "sectionIds": section_ids,
+                    "cohortIds": section_ids,
+                }
+
+            group_ids = [f"L{level}G{index}" for index in range(1, lecture_group_count + 1)]
+
+            for code, student_count in sorted(course_counts.items()):
+                course_group_count = max(
+                    1,
+                    math.ceil(student_count / max(1, self.max_lecture_group_size)),
+                )
+                course_group_count = min(course_group_count, lecture_group_count)
+                course_sizes = self._split_evenly(student_count, course_group_count)
+
+                for group_id, size in zip(group_ids, course_sizes):
                     if size <= 0:
                         continue
 
-                    group_id = f"L{level}{clean_code}G{index}"
-                    departments = self._course_departments_for_level(course, level)
-                    if level <= 2:
-                        departments = []
+                    self.course_group_sizes[code][group_id] = size
+                    course_codes = self.group_details[group_id]["courseCodes"]
+                    if code not in course_codes:
+                        course_codes.append(code)
 
-                    self.group_sizes[group_id] = size
-                    self.group_details[group_id] = {
-                        "groupId": group_id,
-                        "level": level,
-                        "studentCount": size,
-                        "department": None,
-                        "departments": departments,
-                        "courseCodes": [code],
-                    }
-
-        self._assign_generated_cohorts_to_groups()
         return bool(self.group_details)
 
     def _assign_generated_cohorts_to_groups(self) -> None:
@@ -2446,6 +2485,30 @@ class SchedulingEngine:
             }
 
         return group_ids
+
+    def _ensure_arabic_online_group_for_course(self, code: str, course: dict) -> List[str]:
+        level = self._normalize_levels(course)[0]
+        clean_code = "".join(ch for ch in code if ch.isalnum())
+        group_id = f"L{level}ARABIC{clean_code}"
+
+        if group_id not in self.group_details:
+            total = self._safe_int(course.get("totalStudentCount"), 0)
+            if total <= 0:
+                total = self._safe_int(course.get("enrollmentCount"), 0)
+
+            self.group_sizes[group_id] = total
+            self.group_details[group_id] = {
+                "groupId": group_id,
+                "level": level,
+                "studentCount": total,
+                "department": None,
+                "departments": self._normalize_departments(course.get("departments")),
+                "courseCodes": [code],
+                "isArabicOnlineGroup": True,
+                "isOnlineGroup": True,
+            }
+
+        return [group_id]
 
     def _matching_level_student_count(self, level: int, departments: List[str]) -> int:
         department_set = set(departments)
@@ -2756,16 +2819,56 @@ class SchedulingEngine:
             if candidate and self._sessions_can_overlap(session, candidate):
                 continue
 
-            return True
+            if self._same_group_sessions_conflict(session, candidate):
+                return True
 
         if candidate and candidate.get("isRecordedOnline"):
             return False
 
-        for cohort_id in self.group_details.get(group_id, {}).get("cohortIds", []):
+        for cohort_id in self._cohort_ids_for_candidate(group_id, candidate):
             if self._has_cohort_time_conflict(cohort_id, day, slot, candidate):
                 return True
 
         return False
+
+    def _same_group_sessions_conflict(
+        self,
+        existing: dict,
+        candidate: Optional[dict],
+    ) -> bool:
+        if not candidate:
+            return True
+
+        existing_section = existing.get("sectionId")
+        candidate_section = candidate.get("sectionId")
+
+        if existing_section and candidate_section and existing_section != candidate_section:
+            return False
+
+        return True
+
+    def _cohort_ids_for_candidate(
+        self,
+        group_id: str,
+        candidate: Optional[dict],
+    ) -> List[str]:
+        if candidate and (
+            candidate.get("isRecordedOnline")
+            or (
+                candidate.get("isOnline")
+                and candidate.get("courseCode") in ONLINE_RECORDED_COURSES
+            )
+        ):
+            return []
+
+        if candidate and candidate.get("sectionId"):
+            return [candidate["sectionId"]]
+
+        details = self.group_details.get(group_id, {})
+        return list(details.get("sectionIds") or details.get("cohortIds") or [group_id])
+
+    def _cohort_ids_for_session(self, session: dict) -> List[str]:
+        return self._cohort_ids_for_candidate(session.get("groupId"), session)
 
     def _has_cohort_time_conflict(
         self,
@@ -2779,6 +2882,9 @@ class SchedulingEngine:
                 continue
 
             for session in sessions:
+                if cohort_id not in self._cohort_ids_for_session(session):
+                    continue
+
                 if session.get("dayOfWeek") != day:
                     continue
 
@@ -2871,7 +2977,17 @@ class SchedulingEngine:
         return f"{minutes // 60:02d}:{minutes % 60:02d}"
 
     def _section_label(self, group_id: str, index: int) -> str:
-        return f"{group_id}-S{index}"
+        if index <= 0:
+            index = 1
+
+        letters = []
+        value = index
+        while value:
+            value -= 1
+            letters.append(chr(ord("A") + (value % 26)))
+            value //= 26
+
+        return f"{group_id}{''.join(reversed(letters))}"
 
     def _sort_sessions(self, sessions: List[dict]) -> List[dict]:
         day_order = {
