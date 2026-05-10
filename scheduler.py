@@ -52,7 +52,7 @@ class SchedulingEngine:
         )
         self.min_sections_per_lecture_group = max(
             1,
-            self._safe_int(self.input_data.get("minSectionsPerLectureGroup"), 2),
+            self._safe_int(self.input_data.get("minSectionsPerLectureGroup"), 1),
         )
         self.target_group_size = self.max_lecture_group_size
         self.section_capacity = self.max_section_size
@@ -64,11 +64,15 @@ class SchedulingEngine:
 
         self.courses = self._normalize_courses()
         self.aptech_courses = self._normalize_aptech_courses()
-        self.instructors = self._normalize_instructors(
-            list(self.input_data.get("instructors") or [])
-            + list(self.input_data.get("regularInstructors") or [])
-            + list(self.input_data.get("arabicInstructors") or [])
+        raw_instructors = []
+        raw_instructors.extend(self._instructors_with_source(self.input_data.get("instructors"), "all"))
+        raw_instructors.extend(
+            self._instructors_with_source(self.input_data.get("regularInstructors"), "college")
         )
+        raw_instructors.extend(
+            self._instructors_with_source(self.input_data.get("arabicInstructors"), "arabic")
+        )
+        self.instructors = self._normalize_instructors(raw_instructors)
         self.aptech_instructors = self._normalize_instructors(
             self.input_data.get("aptechInstructors", [])
         )
@@ -124,6 +128,7 @@ class SchedulingEngine:
         aptech_courses_output = self._build_aptech_courses_output()
         college_courses_output = self._build_course_sessions_output("college")
         arabic_courses_output = self._build_course_sessions_output("arabic")
+        student_group_schedules_output = self._build_student_group_schedules_output()
         conflicts = self.validate_no_conflicts()
         conflicts.extend(self.validate_academic_constraints())
 
@@ -164,10 +169,12 @@ class SchedulingEngine:
             },
             "optimizationSummary": optimization_summary,
             "groupSchedules": self._build_group_schedules_output(),
+            "studentGroupSchedules": student_group_schedules_output,
             "instructorSchedules": self._build_instructor_schedules_output(),
             "roomSchedules": self._build_room_schedules_output(),
             "totalSessions": total_sessions,
             "totalGroups": total_groups,
+            "totalStudentGroups": len(student_group_schedules_output),
             "metadata": {
                 "semesterId": self.input_data.get("semesterId"),
                 "unscheduledCount": unscheduled_count,
@@ -325,7 +332,10 @@ class SchedulingEngine:
         return self._merge_passthrough_course_fields(session, course)
 
     def _create_level_groups(self) -> None:
-        if self._create_student_groups_from_input():
+        if (
+            self.input_data.get("useProvidedStudentGroups") is True
+            and self._create_student_groups_from_input()
+        ):
             return
 
         generated = self._create_student_groups_from_courses()
@@ -649,11 +659,13 @@ class SchedulingEngine:
         return False
 
     def _get_matching_instructors(self, course_code: str, session_type: str) -> List[dict]:
-        course_instructor_ids = set(self.courses.get(course_code, {}).get("instructorIds") or [])
+        course = self.courses.get(course_code, {})
+        course_instructor_ids = set(course.get("instructorIds") or [])
         assigned = [
             instructor
             for instructor in self.instructors.values()
-            if (
+            if self._instructor_matches_course_category(instructor, course)
+            and (
                 course_code in self._assigned_course_codes(instructor)
                 or instructor.get("instructorId") in course_instructor_ids
             )
@@ -1355,6 +1367,65 @@ class SchedulingEngine:
 
         return result
 
+    def _build_student_group_schedules_output(self) -> List[dict]:
+        result = []
+
+        for lecture_group_id in sorted(self.group_details, key=self._group_sort_key):
+            details = self.group_details[lecture_group_id]
+            sessions = self._sort_sessions(self.group_schedules.get(lecture_group_id, []))
+            section_ids = list(details.get("sectionIds") or [])
+            lectures = [
+                session
+                for session in sessions
+                if not session.get("sectionId")
+            ]
+
+            if not section_ids:
+                result.append({
+                    "groupId": lecture_group_id,
+                    "lectureGroupId": lecture_group_id,
+                    "level": details.get("level"),
+                    "studentCount": details.get("studentCount", 0),
+                    "courseCodes": details.get("courseCodes", []),
+                    "lectures": lectures,
+                    "sections": [
+                        session
+                        for session in sessions
+                        if session.get("sectionId")
+                    ],
+                    "sessions": sessions,
+                    "totalSessions": len(sessions),
+                })
+                continue
+
+            for section_id in section_ids:
+                section_sessions = [
+                    session
+                    for session in sessions
+                    if session.get("sectionId") == section_id
+                ]
+                student_count = max(
+                    [self._safe_int(session.get("studentCount"), 0) for session in section_sessions]
+                    or [0]
+                )
+                combined_sessions = self._sort_sessions(lectures + section_sessions)
+
+                result.append({
+                    "groupId": section_id,
+                    "sectionGroupId": section_id,
+                    "lectureGroupId": lecture_group_id,
+                    "sectionLetter": section_id.replace(lecture_group_id, "", 1),
+                    "level": details.get("level"),
+                    "studentCount": student_count,
+                    "courseCodes": details.get("courseCodes", []),
+                    "lectures": lectures,
+                    "sections": section_sessions,
+                    "sessions": combined_sessions,
+                    "totalSessions": len(combined_sessions),
+                })
+
+        return result
+
     def _build_course_table_output(self) -> dict:
         levels = []
 
@@ -1680,18 +1751,33 @@ class SchedulingEngine:
     def _normalize_courses(self) -> Dict[str, dict]:
         raw_courses = []
 
-        raw_courses.extend(self.input_data.get("courses") or [])
-        raw_courses.extend(self.input_data.get("regularCourses") or [])
+        for item in self.input_data.get("courses") or []:
+            if isinstance(item, dict):
+                raw_courses.append({**item, "_courseCategory": "college"})
+
+        for item in self.input_data.get("regularCourses") or []:
+            if isinstance(item, dict):
+                raw_courses.append({**item, "_courseCategory": "college"})
 
         for item in self.input_data.get("onlineCourses") or []:
             if isinstance(item, dict):
                 code = self._course_code(item)
                 if code in ARABIC_ONLINE_COURSES:
-                    raw_courses.append({**item, "labType": None, "isArabicOnline": True})
+                    raw_courses.append({
+                        **item,
+                        "labType": None,
+                        "isArabicOnline": True,
+                        "_courseCategory": "arabic",
+                    })
 
         for item in self.input_data.get("arabicCourses") or []:
             if isinstance(item, dict):
-                raw_courses.append({**item, "labType": None, "isArabicOnline": True})
+                raw_courses.append({
+                    **item,
+                    "labType": None,
+                    "isArabicOnline": True,
+                    "_courseCategory": "arabic",
+                })
 
         courses = {}
 
@@ -1714,6 +1800,13 @@ class SchedulingEngine:
             normalized["courseName"] = item.get("courseName") or code
             if code in ARABIC_ONLINE_COURSES:
                 normalized["isArabicOnline"] = True
+            normalized["courseCategory"] = (
+                "arabic"
+                if normalized.get("isArabicOnline") is True
+                else str(item.get("courseCategory") or item.get("_courseCategory") or "college")
+                .strip()
+                .lower()
+            )
             normalized["levels"] = self._normalize_levels(item)
             normalized["level"] = normalized["levels"][0]
             normalized["academicLevel"] = normalized["levels"][0]
@@ -1765,6 +1858,45 @@ class SchedulingEngine:
 
         return courses
 
+    def _instructors_with_source(self, raw_instructors, source: str) -> List[dict]:
+        result = []
+
+        for item in raw_instructors or []:
+            if not isinstance(item, dict):
+                continue
+
+            tagged = dict(item)
+            sources = set(self._normalize_instructor_sources(tagged.get("sourceCategories")))
+            sources.update(self._normalize_instructor_sources(source))
+            tagged["sourceCategories"] = sorted(sources)
+            result.append(tagged)
+
+        return result
+
+    def _normalize_instructor_sources(self, sources) -> List[str]:
+        if sources is None:
+            return []
+
+        if isinstance(sources, str):
+            sources = [sources]
+
+        result = []
+        for source in sources or []:
+            value = str(source).strip().lower()
+            if value in {"regular", "college", "faculty"}:
+                value = "college"
+            elif value in {"arabic", "online", "university"}:
+                value = "arabic"
+            elif value in {"all", "generic", "any"}:
+                value = "all"
+            else:
+                continue
+
+            if value not in result:
+                result.append(value)
+
+        return result
+
     def _normalize_instructors(self, raw_instructors: Iterable[dict]) -> Dict[int, dict]:
         instructors = {}
 
@@ -1794,6 +1926,9 @@ class SchedulingEngine:
                     item.get("assignedCourses", [])
                 ),
                 "availabilities": self._normalize_availabilities(item.get("availabilities")),
+                "sourceCategories": self._normalize_instructor_sources(
+                    item.get("sourceCategories")
+                ),
             }
 
             if instructor_id in instructors:
@@ -1820,6 +1955,10 @@ class SchedulingEngine:
                     "DOCTOR"
                     if "DOCTOR" in {existing.get("instructorType"), normalized.get("instructorType")}
                     else existing.get("instructorType") or normalized.get("instructorType")
+                )
+                existing["sourceCategories"] = sorted(
+                    set(existing.get("sourceCategories") or [])
+                    | set(normalized.get("sourceCategories") or [])
                 )
             else:
                 instructors[instructor_id] = normalized
@@ -1906,7 +2045,8 @@ class SchedulingEngine:
             instructors = [
                 instructor
                 for instructor in self.instructors.values()
-                if (
+                if self._instructor_matches_course_category(instructor, self.courses[code])
+                and (
                     code in self._assigned_course_codes(instructor)
                     or instructor.get("instructorId") in set(self.courses[code].get("instructorIds") or [])
                 )
@@ -2196,6 +2336,25 @@ class SchedulingEngine:
             if self._course_code(item)
         }
 
+    def _course_category(self, course: dict) -> str:
+        if course.get("isArabicOnline") is True:
+            return "arabic"
+
+        code = self._course_code(course)
+        if code in ARABIC_ONLINE_COURSES:
+            return "arabic"
+
+        category = str(course.get("courseCategory") or "college").strip().lower()
+        return "arabic" if category == "arabic" else "college"
+
+    def _instructor_matches_course_category(self, instructor: dict, course: dict) -> bool:
+        sources = set(instructor.get("sourceCategories") or [])
+
+        if not sources or "all" in sources:
+            return True
+
+        return self._course_category(course) in sources
+
     def _normalize_assigned_courses(self, assigned_courses) -> List[dict]:
         if isinstance(assigned_courses, str):
             assigned_courses = [assigned_courses]
@@ -2261,7 +2420,10 @@ class SchedulingEngine:
                 continue
 
             level = self._safe_int(item.get("level"), 1)
+            if level <= 0:
+                level = 1
             group_id = str(item.get("groupId") or f"L{level}G{index}").strip()
+            group_id = self._normalize_group_id_level(group_id, level)
             if not group_id:
                 continue
 
@@ -2288,6 +2450,14 @@ class SchedulingEngine:
             }
 
         return bool(self.group_details)
+
+    def _normalize_group_id_level(self, group_id: str, level: int) -> str:
+        import re
+
+        if level <= 0:
+            level = 1
+
+        return re.sub(r"^L0(?=G)", f"L{level}", str(group_id).strip(), flags=re.IGNORECASE)
 
     def _create_student_groups_from_courses(self) -> bool:
         level_course_counts: Dict[int, Dict[str, int]] = defaultdict(dict)
@@ -2594,13 +2764,18 @@ class SchedulingEngine:
 
         for instructor_id in instructor_ids:
             instructor = self.instructors.get(instructor_id)
-            if instructor and instructor.get("instructorType") == "DOCTOR":
+            if (
+                instructor
+                and instructor.get("instructorType") == "DOCTOR"
+                and self._instructor_matches_course_category(instructor, course)
+            ):
                 return instructor
 
         code = self._course_code(course)
         for instructor in self.instructors.values():
             if (
                 instructor.get("instructorType") == "DOCTOR"
+                and self._instructor_matches_course_category(instructor, course)
                 and code in self._assigned_course_codes(instructor)
             ):
                 return instructor
@@ -2684,7 +2859,7 @@ class SchedulingEngine:
         else:
             levels = [self._safe_int(raw_levels, None)]
 
-        result = sorted({level for level in levels if level is not None})
+        result = sorted({level for level in levels if level is not None and level > 0})
         return result or [1]
 
     def _normalize_departments(self, value) -> List[str]:
@@ -2713,8 +2888,12 @@ class SchedulingEngine:
             if not isinstance(item, dict):
                 continue
 
+            level = self._safe_int(item.get("level"), 1)
+            if level <= 0:
+                level = 1
+
             result.append({
-                "level": self._safe_int(item.get("level"), 1),
+                "level": level,
                 "department": (
                     str(item.get("department")).strip().upper()
                     if item.get("department") is not None else None
@@ -2772,6 +2951,11 @@ class SchedulingEngine:
         merged["enrollmentCount"] = merged["totalStudentCount"]
         merged["labType"] = current.get("labType") or incoming.get("labType")
         merged["isArabicOnline"] = current.get("isArabicOnline") or incoming.get("isArabicOnline")
+        merged["courseCategory"] = (
+            "arabic"
+            if current.get("courseCategory") == "arabic" or incoming.get("courseCategory") == "arabic"
+            else "college"
+        )
         merged["lectureDurationMinutes"] = (
             current.get("lectureDurationMinutes") or incoming.get("lectureDurationMinutes")
         )
@@ -3047,15 +3231,21 @@ class SchedulingEngine:
                 "groups": [],
             },
             "groupSchedules": [],
+            "studentGroupSchedules": [],
             "instructorSchedules": [],
             "roomSchedules": [],
             "totalSessions": 0,
             "totalGroups": 0,
+            "totalStudentGroups": 0,
             "metadata": {
                 "unscheduledCount": 1 + len(getattr(self, "skipped_courses", {})),
                 "unscheduledReasons": [message],
+                "warnings": getattr(self, "warnings", []),
                 "conflicts": [],
                 "unscheduledAptechCourses": [],
-                "skippedCourses": [],
+                "skippedCourses": [
+                    {"courseCode": code, "reason": reason}
+                    for code, reason in sorted(getattr(self, "skipped_courses", {}).items())
+                ],
             },
         }
