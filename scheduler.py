@@ -25,6 +25,8 @@ PROJECT_DISPLAY_DETAILS = {
 PHYSICS_LAB_ROOM_IDS = {79, 80}
 PHYSICS_LAB_ROOM_NUMBERS = {"2201", "2202"}
 MIN_EFFECTIVE_ROOM_CAPACITY = 150
+ROOM_CAPACITY_OVERRIDES = {"M01": 250}
+ROOM_TYPE_OVERRIDES = {"14408": "GENERAL"}
 DEFAULT_LECTURE_DURATION_MINUTES = 120
 DEFAULT_SECTION_DURATION_MINUTES = 120
 SPECIAL_LECTURE_DURATIONS = {"CS214": 60, "ETS401": 60}
@@ -59,9 +61,7 @@ class SchedulingEngine:
         )
         if self.explicit_max_lecture_group_size is not None and self.explicit_max_lecture_group_size <= 0:
             self.explicit_max_lecture_group_size = None
-        self.allow_online_lecture_overflow = (
-            self.input_data.get("allowOnlineRoomsForLargeLectures") is not False
-        )
+        self.allow_online_lecture_overflow = False
         self.max_section_size = self._safe_int(
             self.input_data.get("maxSectionSize", self.input_data.get("sectionCapacity")),
             50,
@@ -221,7 +221,7 @@ class SchedulingEngine:
                 reason = self._diagnose_unscheduled_demand(demand)
                 self.unscheduled_reasons.append(reason)
 
-    def _demand_priority_key(self, demand: dict) -> Tuple[int, int, int, int, str, str]:
+    def _demand_priority_key(self, demand: dict) -> Tuple[int, int, int, int, int, str, str]:
         placements = self._demand_candidate_placement_count(demand)
         if placements <= 0:
             placements = 999_999
@@ -229,15 +229,24 @@ class SchedulingEngine:
         course_code = demand.get("courseCode") or ""
         session_type = demand.get("sessionType") or ""
         already_scheduled = self._scheduled_course_session_count(course_code, session_type)
+        course_total_students = self._course_total_student_count(self.courses.get(course_code, {}))
 
         return (
             placements,
+            -course_total_students,
             already_scheduled,
             -self._safe_int(demand.get("difficulty"), 0),
             -self._safe_int(demand.get("studentCount", demand.get("groupSize")), 0),
             course_code,
             demand.get("groupId") or "",
         )
+
+    def _course_total_student_count(self, course: dict) -> int:
+        total = self._safe_int(course.get("totalStudentCount"), 0)
+        if total > 0:
+            return total
+
+        return sum(self._safe_int(value, 0) for value in self._course_level_student_counts(course).values())
 
     def _scheduled_course_session_count(self, course_code: str, session_type: str) -> int:
         count = 0
@@ -731,6 +740,49 @@ class SchedulingEngine:
                 scheduled += 1
 
         if scheduled <= 0:
+            fallback_rooms = []
+            if demand.get("labType") == "LAB_ONLY":
+                fallback_rooms = self._get_matching_rooms("SECTION", "GENERAL_LAB", 1, False)
+
+            if fallback_rooms:
+                self._restore_state(checkpoint)
+                scheduled = 0
+
+                for index, section_size in enumerate(section_sizes, start=1):
+                    section_id = self._section_label(group_id, index)
+
+                    section_demand = {
+                        "kind": "SECTION",
+                        "sessionType": "SECTION",
+                        "courseCode": course_code,
+                        "courseName": demand["courseName"],
+                        "groupId": group_id,
+                        "studentCount": section_size,
+                        "sectionId": section_id,
+                        "isOnline": False,
+                        "labType": "GENERAL_LAB",
+                    }
+
+                    if self._schedule_one_section(section_demand, instructors, fallback_rooms):
+                        scheduled += 1
+
+                if scheduled > 0:
+                    self.warnings.append(
+                        f"Used a general room fallback for {course_code} sections group={group_id} because lab rooms were not enough."
+                    )
+
+                    if scheduled != len(section_sizes):
+                        self.warnings.append(
+                            self._diagnose_partial_sections(
+                                demand,
+                                scheduled,
+                                len(section_sizes),
+                                max(1, demand.get("minSections", 1)),
+                            )
+                        )
+
+                    return True
+
             self._restore_state(checkpoint)
             return self._add_unscheduled(
                 demand,
@@ -809,11 +861,15 @@ class SchedulingEngine:
         ]
 
         if session_type == "LECTURE":
-            return [
+            doctors = [
                 instructor
                 for instructor in assigned
                 if instructor.get("instructorType") == "DOCTOR"
             ]
+            if doctors:
+                return doctors
+
+            return assigned
 
         return [
             instructor
@@ -834,23 +890,10 @@ class SchedulingEngine:
         rooms = list(self.rooms.values())
 
         if session_type == "LECTURE":
-            general_rooms = [
-                room
-                for room in rooms
-                if room.get("roomType") == "GENERAL"
-            ]
-            candidates = [
-                room
-                for room in general_rooms
-                if self._safe_int(room.get("capacity"), 0) >= max(1, student_count)
-            ]
-            if candidates or not self.allow_online_lecture_overflow:
-                return candidates
-
             return [
                 room
                 for room in rooms
-                if room.get("roomType") == "ONLINE"
+                if room.get("roomType") == "GENERAL"
                 and self._safe_int(room.get("capacity"), 0) >= max(1, student_count)
             ]
 
@@ -894,14 +937,13 @@ class SchedulingEngine:
         if self.explicit_max_lecture_group_size:
             return self.explicit_max_lecture_group_size
 
-        room_types = {"GENERAL"}
-        if self.allow_online_lecture_overflow:
-            room_types.add("ONLINE")
+        return max(1, self.max_lecture_group_size)
 
+    def _largest_general_room_capacity(self) -> int:
         capacities = [
             self._safe_int(room.get("capacity"), 0)
             for room in self.rooms.values()
-            if room.get("roomType") in room_types
+            if room.get("roomType") == "GENERAL"
         ]
         if capacities:
             return max(1, max(capacities))
@@ -910,7 +952,114 @@ class SchedulingEngine:
 
     def _course_lecture_group_count(self, course: dict, student_count: int) -> int:
         capacity = self._course_lecture_group_capacity(course)
+        largest_room_capacity = self._largest_general_room_capacity()
+        flexible_single_group_limit = int(math.ceil(capacity * 1.35))
+
+        if (
+            student_count <= largest_room_capacity
+            and student_count <= flexible_single_group_limit
+        ):
+            return 1
+
         return max(1, math.ceil(max(1, student_count) / max(1, capacity)))
+
+    def _course_lecture_instructor_slot_count(self, course: dict) -> int:
+        course_code = self._course_code(course)
+        if not course_code:
+            return 0
+
+        instructors = self._get_matching_instructors(course_code, "LECTURE")
+        if not instructors:
+            return 0
+
+        slots = self._preferred_slots_for_course(course_code, "LECTURE")
+        count = 0
+
+        for instructor in instructors:
+            for day in self.days:
+                for slot in slots:
+                    if self._is_instructor_available(instructor, day, slot):
+                        count += 1
+
+        return count
+
+    def _allocate_course_group_counts_by_level(
+        self,
+        course: dict,
+        level_counts: Dict[int, int],
+    ) -> Dict[int, int]:
+        cleaned_counts = {
+            level: self._safe_int(count, 0)
+            for level, count in (level_counts or {}).items()
+            if self._safe_int(count, 0) > 0
+        }
+        if not cleaned_counts:
+            return {}
+
+        target_capacity = self._course_lecture_group_capacity(course)
+        room_capacity = self._largest_general_room_capacity()
+        total_students = sum(cleaned_counts.values())
+        target_group_count = max(
+            1,
+            math.ceil(total_students / max(1, target_capacity)),
+        )
+        room_min_group_count = max(
+            1,
+            math.ceil(total_students / max(1, room_capacity)),
+        )
+        instructor_slot_count = self._course_lecture_instructor_slot_count(course)
+
+        total_group_count = target_group_count
+        if (
+            instructor_slot_count > 0
+            and instructor_slot_count < target_group_count
+            and instructor_slot_count >= room_min_group_count
+        ):
+            total_group_count = instructor_slot_count
+
+        if len(cleaned_counts) > 1 and total_students <= room_capacity and total_group_count == 1:
+            primary_level = max(cleaned_counts, key=lambda level: (cleaned_counts[level], level))
+            return {primary_level: 1}
+
+        per_level_min = {
+            level: max(1, math.ceil(count / max(1, room_capacity)))
+            for level, count in cleaned_counts.items()
+        }
+        per_level_target = {
+            level: max(1, math.ceil(count / max(1, target_capacity)))
+            for level, count in cleaned_counts.items()
+        }
+
+        if len(cleaned_counts) == 1:
+            level, count = next(iter(cleaned_counts.items()))
+            return {level: self._course_lecture_group_count(course, count)}
+
+        if sum(per_level_min.values()) > total_group_count:
+            return per_level_target
+
+        allocation = dict(per_level_min)
+        remaining = total_group_count - sum(allocation.values())
+        if remaining <= 0:
+            return allocation
+
+        candidates = []
+        for level, count in cleaned_counts.items():
+            room_groups = allocation[level]
+            target_groups = per_level_target[level]
+            if room_groups >= target_groups:
+                continue
+
+            pressure = count / max(1, room_groups)
+            candidates.append((pressure, count, level))
+
+        for _, _, level in sorted(candidates, reverse=True):
+            if remaining <= 0:
+                break
+
+            allocation[level] += 1
+            remaining -= 1
+
+        return allocation
 
     def _can_use_instructor(
         self,
@@ -1713,9 +1862,17 @@ class SchedulingEngine:
         for course in self.aptech_courses:
             code = course["courseCode"]
             course_instructor_ids = set(course.get("instructorIds") or [])
+            course_instructor_names = {
+                self._normalized_person_name(course.get("instructorName")),
+                self._normalized_person_name(course.get("instructorNameAr")),
+            }
+            course_instructor_names.discard("")
+            is_aptech_computer = self._is_aptech_computer_course(course)
             matching = []
             seen_instructor_ids = set()
-            for instructor in list(self.aptech_instructors.values()) + list(self.instructors.values()):
+            instructor_pool = list(self.aptech_instructors.values()) + list(self.instructors.values())
+
+            for instructor in instructor_pool:
                 instructor_id = instructor.get("instructorId")
                 if instructor_id in seen_instructor_ids:
                     continue
@@ -1727,6 +1884,38 @@ class SchedulingEngine:
                     matching.append(instructor)
                     seen_instructor_ids.add(instructor_id)
 
+            if course_instructor_names:
+                for instructor in instructor_pool:
+                    instructor_id = instructor.get("instructorId")
+                    if instructor_id in seen_instructor_ids:
+                        continue
+
+                    instructor_names = {
+                        self._normalized_person_name(instructor.get("name")),
+                        self._normalized_person_name(instructor.get("nameAr")),
+                    }
+
+                    if course_instructor_names.intersection(instructor_names):
+                        matching.append(instructor)
+                        seen_instructor_ids.add(instructor_id)
+
+            if is_aptech_computer:
+                assistant_matches = [
+                    instructor
+                    for instructor in matching
+                    if instructor.get("instructorType") == "TA"
+                ]
+                if assistant_matches:
+                    matching = assistant_matches
+
+            matching.sort(
+                key=lambda instructor: (
+                    0 if instructor.get("instructorType") == "TA" else 1,
+                    len(self.instructor_schedules.get(instructor.get("instructorId"), [])),
+                    instructor.get("instructorId") or 0,
+                )
+            )
+
             assigned = matching[0] if matching else None
             instructor_id = (
                 assigned.get("instructorId")
@@ -1734,6 +1923,7 @@ class SchedulingEngine:
                 else (next(iter(course_instructor_ids), None) or course.get("instructorId"))
             )
             instructor_name = assigned.get("name") if assigned else course.get("instructorName")
+            instructor_type = assigned.get("instructorType") if assigned else None
             availabilities = []
 
             if isinstance(course.get("availabilities"), list) and course["availabilities"]:
@@ -1753,12 +1943,29 @@ class SchedulingEngine:
                 "courseName": course.get("courseName", code),
                 "assignedInstructorId": instructor_id,
                 "assignedInstructorName": instructor_name,
+                "assignedInstructorType": instructor_type,
+                "levels": self._normalize_levels(course),
+                "departments": self._normalize_departments(course.get("departments")),
+                "totalStudentCount": self._safe_int(course.get("totalStudentCount"), 0),
                 "dayOfWeek": assignment.get("dayOfWeek"),
                 "timeSlot": assignment.get("timeSlot"),
                 "status": "SCHEDULED" if assignment.get("timeSlot") else "UNSCHEDULED",
             })
 
         return result
+
+    def _is_aptech_computer_course(self, course: dict) -> bool:
+        code = str(course.get("courseCode") or "").strip().upper()
+        name = str(course.get("courseName") or "").strip().upper()
+        name_ar = str(course.get("courseNameAr") or "").strip().upper()
+
+        return (
+            code.endswith("-P2")
+            or "APTECH COMPUTER" in name
+            or "COMPUTER" in name and "APTECH" in name
+            or "ابتك" in name_ar
+            or "ابتيك" in name_ar
+        )
 
     def _choose_aptech_assignment(
         self,
@@ -1791,6 +1998,11 @@ class SchedulingEngine:
             for slot in self._aptech_slots_for_availability(availability):
                 key = (identity, day, slot)
                 if key in busy:
+                    continue
+                if (
+                    instructor_id is not None
+                    and self._has_instructor_time_conflict(instructor_id, day, slot)
+                ):
                     continue
 
                 busy.add(key)
@@ -2005,6 +2217,11 @@ class SchedulingEngine:
                 if normalized.get("isArabicOnline") is True
                 else self._normalized_lab_type(item.get("labType"))
             )
+            if (
+                normalized["labType"] == "LAB_ONLY"
+                and self._course_allows_general_section_rooms(item)
+            ):
+                normalized["labType"] = "GENERAL_LAB"
             normalized["instructorIds"] = self._extract_course_instructor_ids(item)
             normalized["lectureDurationMinutes"] = self._course_lecture_duration(normalized)
             normalized["sectionDurationMinutes"] = self._course_section_duration(normalized)
@@ -2193,9 +2410,12 @@ class SchedulingEngine:
 
             room_number = str(item.get("roomNumber") or room_id)
             room_type = str(item.get("roomType") or "GENERAL").strip().upper()
+            room_number_key = room_number.strip().upper()
 
             if room_id in PHYSICS_LAB_ROOM_IDS or room_number in PHYSICS_LAB_ROOM_NUMBERS:
                 room_type = "PH101_LA"
+            elif room_number_key in ROOM_TYPE_OVERRIDES:
+                room_type = ROOM_TYPE_OVERRIDES[room_number_key]
             elif room_type in {"LECTURE", "LECTURE_HALL", "GENERAL_LAB"}:
                 room_type = "GENERAL"
             elif room_type == "LAB":
@@ -2206,6 +2426,8 @@ class SchedulingEngine:
                 room_type = "ONLINE"
 
             capacity = self._safe_int(item.get("capacity"), 0)
+            if room_number_key in ROOM_CAPACITY_OVERRIDES:
+                capacity = max(capacity, ROOM_CAPACITY_OVERRIDES[room_number_key])
             if room_type != "ONLINE":
                 capacity = max(capacity, MIN_EFFECTIVE_ROOM_CAPACITY)
 
@@ -2574,6 +2796,12 @@ class SchedulingEngine:
 
         return None
 
+    def _normalized_person_name(self, value) -> str:
+        if not value:
+            return ""
+
+        return "".join(str(value).strip().lower().split())
+
     def _course_level(self, course: dict) -> int:
         levels = self._normalize_levels(course)
         return levels[0] if levels else 1
@@ -2603,6 +2831,52 @@ class SchedulingEngine:
             return "GENERAL_LAB"
 
         return lab_type
+
+    def _course_allows_general_section_rooms(self, course: dict) -> bool:
+        truthy_fields = (
+            "allowGeneralSectionRooms",
+            "allowGeneralRoomsForSections",
+            "sectionsInGeneralRooms",
+            "canUseGeneralRoomsForSections",
+        )
+        for field in truthy_fields:
+            if course.get(field) is True:
+                return True
+
+        room_type = str(
+            course.get("sectionRoomType")
+            or course.get("sectionRoom")
+            or course.get("sectionVenueType")
+            or ""
+        ).strip().upper()
+        if room_type in {"GENERAL", "LECTURE", "GENERAL_LAB"}:
+            return True
+
+        room_types = course.get("sectionRoomTypes") or course.get("allowedSectionRoomTypes")
+        if isinstance(room_types, (list, tuple, set)):
+            normalized = {
+                str(item).strip().upper()
+                for item in room_types
+                if str(item).strip()
+            }
+            if normalized.intersection({"GENERAL", "LECTURE", "GENERAL_LAB"}):
+                return True
+
+        code = self._course_code(course)
+        allowed_codes = (
+            self.input_data.get("generalSectionCourses")
+            or self.input_data.get("generalSectionRoomCourses")
+            or self.input_data.get("coursesAllowedGeneralSections")
+            or []
+        )
+        if isinstance(allowed_codes, str):
+            allowed_codes = [allowed_codes]
+
+        return code in {
+            self._course_code(item)
+            for item in allowed_codes
+            if self._course_code(item)
+        }
 
     def _create_student_groups_from_input(self) -> bool:
         raw_groups = self.input_data.get("studentGroups")
@@ -2656,6 +2930,7 @@ class SchedulingEngine:
 
     def _create_student_groups_from_courses(self) -> bool:
         level_course_counts: Dict[int, Dict[str, int]] = defaultdict(dict)
+        course_level_counts: Dict[str, Dict[int, int]] = {}
 
         for code, course in self.courses.items():
             if (
@@ -2673,6 +2948,12 @@ class SchedulingEngine:
 
             for level, count in level_counts.items():
                 level_course_counts[level][code] = count
+                course_level_counts.setdefault(code, {})[level] = count
+
+        course_group_allocations = {
+            code: self._allocate_course_group_counts_by_level(self.courses.get(code, {}), counts)
+            for code, counts in course_level_counts.items()
+        }
 
         for level, course_counts in sorted(level_course_counts.items()):
             max_students = max(course_counts.values(), default=0)
@@ -2680,7 +2961,11 @@ class SchedulingEngine:
                 continue
 
             course_group_counts = {
-                code: self._course_lecture_group_count(self.courses.get(code, {}), count)
+                code: (
+                    course_group_allocations[code].get(level, 0)
+                    if code in course_group_allocations
+                    else self._course_lecture_group_count(self.courses.get(code, {}), count)
+                )
                 for code, count in course_counts.items()
             }
             lecture_group_count = max(1, max(course_group_counts.values(), default=1))
@@ -2706,6 +2991,9 @@ class SchedulingEngine:
 
             for code, student_count in sorted(course_counts.items()):
                 course_group_count = course_group_counts.get(code, 1)
+                if course_group_count <= 0:
+                    continue
+
                 course_group_count = min(course_group_count, lecture_group_count)
                 course_sizes = self._split_evenly(student_count, course_group_count)
 
