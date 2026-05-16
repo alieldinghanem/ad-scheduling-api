@@ -8,6 +8,7 @@ ONLINE_RECORDED_COURSES = set(ARABIC_ONLINE_COURSES)
 IGNORED_ONLINE_COURSES = set()
 DISPLAY_ONLY_COURSES = set()
 PROJECT_COURSES = {"CS405", "CS405-P2"}
+PROJECT_DEFAULT_LEVEL = 4
 PROJECT_DISPLAY_DETAILS = {
     "CS405": {
         "timeSlot": "17:00-19:00",
@@ -361,7 +362,7 @@ class SchedulingEngine:
                 candidate = {
                     "sessionType": "PROJECT",
                     "courseCode": code,
-                    "isOnline": False,
+                    "isOnline": True,
                 }
 
                 if self._has_group_time_conflict(group_id, day, slot, candidate):
@@ -427,6 +428,7 @@ class SchedulingEngine:
             "dayOfWeek": day,
             "timeSlot": slot,
             "studentCount": self.group_sizes.get(group_id, 0),
+            "totalStudentCount": self.group_sizes.get(group_id, 0),
             "isOnline": True,
             "isRecordedOnline": True,
             "isArabicOnline": True,
@@ -447,6 +449,12 @@ class SchedulingEngine:
         details = self._project_details(course)
         component = str(component or "LECTURE").strip().upper()
         is_section = component == "SECTION"
+        level = self._safe_int(
+            self.group_details.get(group_id, {}).get("level"),
+            self._project_levels(course)[0],
+        )
+        instructor_id = details.get("assistantId") if is_section else details.get("doctorId")
+        instructor_name = details.get("assistantName") if is_section else details.get("doctorName")
 
         session = {
             "sessionId": f"SESSION_{self.session_counter:06d}",
@@ -457,22 +465,24 @@ class SchedulingEngine:
             "courseNameAr": course.get("courseNameAr"),
             "groupId": group_id,
             "sectionId": f"{code}-{group_id}-PROJECT-SECTION" if is_section else None,
-            "instructorId": course.get("instructorId"),
-            "instructorName": details.get("assistantName") if is_section else details.get("doctorName"),
+            "instructorId": instructor_id,
+            "instructorName": instructor_name,
             "doctorName": details.get("doctorName"),
             "assistantName": details.get("assistantName"),
             "roomId": None,
-            "roomNumber": (
-                details.get("sectionRoomNumber") if is_section else details.get("lectureRoomNumber")
-            ),
-            "roomType": "PROJECT",
+            "roomNumber": "ONLINE",
+            "roomType": "ONLINE",
             "lectureRoomNumber": details.get("lectureRoomNumber"),
             "sectionRoomNumber": details.get("sectionRoomNumber"),
             "dayOfWeek": day,
             "timeSlot": slot,
             "studentCount": self.group_sizes.get(group_id, 0),
-            "isOnline": False,
+            "isOnline": True,
             "isRecordedOnline": False,
+            "isProject": True,
+            "level": level,
+            "academicLevel": level,
+            "levels": [level],
         }
 
         return self._merge_passthrough_course_fields(session, course)
@@ -538,15 +548,13 @@ class SchedulingEngine:
             if not self._is_project_course(course):
                 continue
 
-            for level in self._normalize_levels(course):
+            for level in self._project_levels(course):
                 group_id = self._project_group_id(level, code)
                 if group_id in self.group_details:
                     continue
 
                 departments = self._normalize_departments(course.get("departments"))
-                total = self._safe_int(course.get("totalStudentCount"), 0)
-                if total <= 0:
-                    total = self._matching_level_student_count(level, departments)
+                total = self._project_student_count(course, level)
 
                 self.group_sizes[group_id] = total
                 self.group_details[group_id] = {
@@ -2494,6 +2502,7 @@ class SchedulingEngine:
     def _is_online_course(self, course: dict) -> bool:
         return (
             course.get("isArabicOnline") is True
+            or self._is_project_course(course)
             or
             course.get("labType") is None
             or self._course_code(course) in self.online_course_codes
@@ -3104,12 +3113,39 @@ class SchedulingEngine:
         return result
 
     def _project_group_ids_for_course(self, code: str, course: dict) -> List[str]:
-        levels = self._normalize_levels(course)
+        levels = self._project_levels(course)
         return [
             self._project_group_id(level, code)
             for level in levels
             if self._project_group_id(level, code) in self.group_details
         ]
+
+    def _project_levels(self, course: dict) -> List[int]:
+        if self._is_project_course(course):
+            return [PROJECT_DEFAULT_LEVEL]
+
+        levels = self._normalize_levels(course)
+        return levels or [PROJECT_DEFAULT_LEVEL]
+
+    def _project_student_count(self, course: dict, level: int) -> int:
+        total = self._safe_int(course.get("totalStudentCount"), 0)
+        if total > 0:
+            return total
+
+        breakdown_total = sum(
+            self._safe_int(row.get("studentCount"), 0)
+            for row in self._normalize_student_breakdown(course.get("studentBreakdown"))
+            if self._safe_int(row.get("level"), None) == level
+        )
+        if breakdown_total > 0:
+            return breakdown_total
+
+        return sum(
+            self._safe_int(details.get("studentCount"), 0)
+            for details in self.group_details.values()
+            if not details.get("isProjectGroup")
+            and self._safe_int(details.get("level"), None) == level
+        )
 
     def _project_group_id(self, level: int, code: str) -> str:
         clean_code = "".join(ch for ch in code if ch.isalnum())
@@ -3284,18 +3320,34 @@ class SchedulingEngine:
     def _project_details(self, course: dict) -> dict:
         code = self._course_code(course)
         defaults = PROJECT_DISPLAY_DETAILS.get(code, {})
+        doctor = self._project_instructor_for_course(course, "DOCTOR")
+        assistant = self._project_instructor_for_course(course, "TA")
+        doctor_id = (
+            self._safe_int(course.get("doctorId"), None)
+            or self._safe_int(course.get("instructorId"), None)
+            or (doctor.get("instructorId") if doctor else None)
+        )
+        assistant_id = (
+            self._safe_int(course.get("assistantId"), None)
+            or self._safe_int(course.get("taId"), None)
+            or (assistant.get("instructorId") if assistant else None)
+        )
 
         return {
             **defaults,
+            "doctorId": doctor_id,
+            "assistantId": assistant_id,
             "doctorName": (
                 course.get("doctorName")
                 or course.get("instructorName")
                 or defaults.get("doctorName")
+                or (doctor.get("name") if doctor else None)
             ),
             "assistantName": (
                 course.get("assistantName")
                 or course.get("taName")
                 or defaults.get("assistantName")
+                or (assistant.get("name") if assistant else None)
             ),
             "timeSlot": course.get("timeSlot") or defaults.get("timeSlot"),
             "lectureRoomNumber": (
@@ -3308,6 +3360,28 @@ class SchedulingEngine:
                 or defaults.get("sectionRoomNumber")
             ),
         }
+
+    def _project_instructor_for_course(self, course: dict, instructor_type: str) -> Optional[dict]:
+        code = self._course_code(course)
+        instructor_ids = [
+            self._safe_int(value, None)
+            for value in course.get("instructorIds") or []
+        ]
+
+        for instructor_id in instructor_ids:
+            instructor = self.instructors.get(instructor_id)
+            if instructor and instructor.get("instructorType") == instructor_type:
+                return instructor
+
+        for instructor in self.instructors.values():
+            if (
+                instructor.get("instructorType") == instructor_type
+                and self._instructor_matches_course_category(instructor, course)
+                and code in self._assigned_course_codes(instructor)
+            ):
+                return instructor
+
+        return None
 
     def _course_difficulty(self, course: dict, is_online: bool) -> int:
         if is_online:
