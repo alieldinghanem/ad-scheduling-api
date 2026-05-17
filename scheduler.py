@@ -353,7 +353,10 @@ class SchedulingEngine:
         return
 
     def _schedule_project_courses(self) -> None:
-        for code, course in sorted(self.courses.items()):
+        for code, course in sorted(
+            self.courses.items(),
+            key=lambda item: self._course_output_sort_key(item[1]),
+        ):
             if not self._is_project_course(course):
                 continue
 
@@ -1670,7 +1673,7 @@ class SchedulingEngine:
 
     def _build_group_schedules_output(self) -> List[dict]:
         result = []
-        for group_id in sorted(self.group_details):
+        for group_id in sorted(self.group_details, key=self._group_sort_key):
             details = {
                 key: value
                 for key, value in self.group_details[group_id].items()
@@ -1704,7 +1707,7 @@ class SchedulingEngine:
                 "totalSessions": len(sessions),
             })
 
-        return result
+        return sorted(result, key=self._course_output_sort_key)
 
     def _build_student_group_schedules_output(self) -> List[dict]:
         result = []
@@ -1799,7 +1802,10 @@ class SchedulingEngine:
     def _build_course_sessions_output(self, category: str) -> List[dict]:
         result = []
 
-        for code, course in sorted(self.courses.items()):
+        for code, course in sorted(
+            self.courses.items(),
+            key=lambda item: self._course_output_sort_key(item[1]),
+        ):
             is_arabic = course.get("isArabicOnline") is True
             if category == "arabic" and not is_arabic:
                 continue
@@ -1832,7 +1838,7 @@ class SchedulingEngine:
                 "status": "SCHEDULED" if sessions else "UNSCHEDULED",
             })
 
-        return result
+        return sorted(result, key=self._course_output_sort_key)
 
     def _display_only_courses_for_group(self, group_id: str) -> List[dict]:
         details = self.group_details.get(group_id, {})
@@ -1867,7 +1873,7 @@ class SchedulingEngine:
         result = []
         busy = set()
 
-        for course in self.aptech_courses:
+        for course in sorted(self.aptech_courses, key=self._course_output_sort_key):
             code = course["courseCode"]
             course_instructor_ids = set(course.get("instructorIds") or [])
             course_instructor_names = {
@@ -1939,28 +1945,105 @@ class SchedulingEngine:
             elif assigned and assigned.get("availabilities"):
                 availabilities = assigned["availabilities"]
 
-            assignment = self._choose_aptech_assignment(
+            identity_key = self._aptech_course_identity_key(course, instructor_id, instructor_name)
+            share_count = self._aptech_identity_course_count(identity_key)
+            possible_count = self._aptech_possible_assignment_count(instructor_id, availabilities)
+            max_sessions = (
+                math.ceil(possible_count / share_count)
+                if share_count > 1 and possible_count > 0
+                else None
+            )
+            assignments = self._choose_aptech_assignments(
                 instructor_id,
                 instructor_name,
+                instructor_type,
+                course,
                 availabilities,
                 busy,
+                max_sessions=max_sessions,
             )
+            primary_assignment = assignments[0] if assignments else {}
 
             result.append({
                 "courseCode": code,
                 "courseName": course.get("courseName", code),
+                "courseNameAr": course.get("courseNameAr"),
                 "assignedInstructorId": instructor_id,
                 "assignedInstructorName": instructor_name,
                 "assignedInstructorType": instructor_type,
                 "levels": self._normalize_levels(course),
                 "departments": self._normalize_departments(course.get("departments")),
                 "totalStudentCount": self._safe_int(course.get("totalStudentCount"), 0),
-                "dayOfWeek": assignment.get("dayOfWeek"),
-                "timeSlot": assignment.get("timeSlot"),
-                "status": "SCHEDULED" if assignment.get("timeSlot") else "UNSCHEDULED",
+                "dayOfWeek": primary_assignment.get("dayOfWeek"),
+                "timeSlot": primary_assignment.get("timeSlot"),
+                "sessions": assignments,
+                "totalSessions": len(assignments),
+                "status": "SCHEDULED" if assignments else "UNSCHEDULED",
             })
 
-        return result
+        return sorted(result, key=self._course_output_sort_key)
+
+    def _aptech_course_identity_key(self, course: dict, instructor_id=None, instructor_name=None):
+        if instructor_id is not None:
+            return ("id", instructor_id)
+
+        name = (
+            instructor_name
+            or course.get("instructorName")
+            or course.get("name")
+            or course.get("instructorNameAr")
+        )
+        normalized_name = self._normalized_person_name(name)
+        if normalized_name:
+            return ("name", normalized_name)
+
+        return ("course", course.get("courseCode"))
+
+    def _aptech_identity_course_count(self, identity_key) -> int:
+        count = 0
+        for course in self.aptech_courses:
+            if self._aptech_course_identity_key(course) == identity_key:
+                count += 1
+
+        return max(1, count)
+
+    def _aptech_possible_assignment_count(
+        self,
+        instructor_id,
+        availabilities: List[dict],
+    ) -> int:
+        count = 0
+        for availability in self._aptech_search_availabilities(availabilities):
+            day = availability.get("dayOfWeek")
+            if not day:
+                continue
+
+            for slot in self._aptech_slots_for_availability(availability):
+                if (
+                    instructor_id is not None
+                    and self._has_instructor_time_conflict(instructor_id, day, slot)
+                ):
+                    continue
+                count += 1
+
+        return count
+
+    def _aptech_search_availabilities(self, availabilities: List[dict]) -> List[dict]:
+        search_availabilities = list(availabilities or [])
+        if search_availabilities:
+            return search_availabilities
+
+        slots = self.input_data.get("aptechTimeSlots") or self.regular_slots
+        return [
+            {
+                "dayOfWeek": day,
+                "startTime": slot.split("-", 1)[0],
+                "endTime": slot.split("-", 1)[1],
+            }
+            for day in self.days
+            for slot in slots
+            if "-" in slot
+        ]
 
     def _is_aptech_computer_course(self, course: dict) -> bool:
         code = str(course.get("courseCode") or "").strip().upper()
@@ -2017,6 +2100,66 @@ class SchedulingEngine:
                 return {"dayOfWeek": day, "timeSlot": slot}
 
         return {"dayOfWeek": None, "timeSlot": None}
+
+    def _choose_aptech_assignments(
+        self,
+        instructor_id,
+        instructor_name,
+        instructor_type,
+        course: dict,
+        availabilities: List[dict],
+        busy: set,
+        max_sessions: Optional[int] = None,
+    ) -> List[dict]:
+        identity = instructor_id if instructor_id is not None else instructor_name
+        search_availabilities = self._aptech_search_availabilities(availabilities)
+        assignments = []
+        code = course.get("courseCode")
+        course_name = course.get("courseName", code)
+        course_name_ar = course.get("courseNameAr")
+        levels = self._normalize_levels(course)
+        primary_level = levels[0] if levels else None
+        seen_slots = set()
+
+        for availability in search_availabilities:
+            day = availability.get("dayOfWeek")
+            if not day:
+                continue
+
+            for slot in self._aptech_slots_for_availability(availability):
+                key = (identity, day, slot)
+                if key in busy or key in seen_slots:
+                    continue
+                if (
+                    instructor_id is not None
+                    and self._has_instructor_time_conflict(instructor_id, day, slot)
+                ):
+                    continue
+
+                busy.add(key)
+                seen_slots.add(key)
+                start, end = slot.split("-", 1)
+                assignments.append({
+                    "sessionType": "APTECH",
+                    "courseCode": code,
+                    "courseName": course_name,
+                    "courseNameAr": course_name_ar,
+                    "level": primary_level,
+                    "levels": levels,
+                    "dayOfWeek": day,
+                    "startTime": start,
+                    "endTime": end,
+                    "timeSlot": slot,
+                    "instructorId": instructor_id,
+                    "instructorName": instructor_name,
+                    "instructorType": instructor_type,
+                    "studentCount": self._safe_int(course.get("totalStudentCount"), 0),
+                    "isAptech": True,
+                })
+                if max_sessions is not None and len(assignments) >= max_sessions:
+                    return self._sort_aptech_sessions(assignments)
+
+        return self._sort_aptech_sessions(assignments)
 
     def _aptech_slots_for_availability(self, availability: dict) -> List[str]:
         allowed_slots = self.input_data.get("aptechTimeSlots") or []
@@ -3521,14 +3664,19 @@ class SchedulingEngine:
     def _group_sort_key(self, group_id: str):
         import re
 
+        project_match = re.search(r"L(\d+)PROJECT", group_id.upper())
+        if project_match:
+            level = int(project_match.group(1))
+            return (level, 999, "PROJECT", group_id)
+
         match = re.search(r"L(\d+).*?G(\d+)([A-Z]*)", group_id.upper())
         if not match:
-            return (999, 999, group_id)
+            return (999, 999, "", group_id)
 
         level = int(match.group(1))
         group_number = int(match.group(2))
         suffix = match.group(3) or ""
-        return (level, group_number, suffix)
+        return (level, group_number, suffix, group_id)
 
     def _generated_group_id(self, level: int, index: int) -> str:
         letters_per_group = max(
@@ -3744,6 +3892,44 @@ class SchedulingEngine:
                 item["courseCode"],
                 item.get("sectionId") or "",
             ),
+        )
+
+    def _sort_aptech_sessions(self, sessions: List[dict]) -> List[dict]:
+        day_order = {
+            day: index
+            for index, day in enumerate(self.days)
+        }
+
+        return sorted(
+            sessions,
+            key=lambda item: (
+                self._safe_int(item.get("level"), 999),
+                day_order.get(item.get("dayOfWeek"), 999),
+                item.get("timeSlot") or "",
+                item.get("courseCode") or "",
+                item.get("instructorName") or "",
+            ),
+        )
+
+    def _course_output_sort_key(self, item: dict):
+        code = item.get("courseCode") or ""
+        course = self.courses.get(code, item)
+        is_project = self._is_project_course(course)
+        levels = (
+            item.get("levels")
+            if isinstance(item.get("levels"), list) and item.get("levels")
+            else self._normalize_levels(course)
+        )
+        primary_level = min(
+            [self._safe_int(level, 999) for level in levels]
+            or [999]
+        )
+
+        return (
+            1 if is_project else 0,
+            primary_level,
+            str(code),
+            str(item.get("courseName") or ""),
         )
 
     def _add_unscheduled(self, demand: dict, reason: str) -> bool:
