@@ -94,6 +94,31 @@ def normalize_course(raw: Dict[str, Any], force_online: bool = False) -> Dict[st
     }
 
 
+def normalize_aptech_course(raw: Dict[str, Any]) -> Dict[str, Any]:
+    code = str(raw.get("courseCode") or raw.get("code") or "").strip().upper()
+    if not code:
+        raise ValueError("Aptech course is missing courseCode")
+
+    levels = raw.get("levels")
+    if levels is None:
+        levels = [safe_int(raw.get("level", 1), 1)]
+    if not isinstance(levels, list):
+        levels = [levels]
+
+    return {
+        **raw,
+        "courseCode": code,
+        "courseName": raw.get("courseName") or code,
+        "levels": [safe_int(value, 1) for value in levels],
+        "totalStudentCount": safe_int(
+            raw.get("totalStudentCount", raw.get("enrollmentCount")),
+            0,
+        ),
+        "studentBreakdown": raw.get("studentBreakdown") if isinstance(raw.get("studentBreakdown"), list) else [],
+        "availabilities": raw.get("availabilities") if isinstance(raw.get("availabilities"), list) else [],
+    }
+
+
 def normalize_instructor(raw: Dict[str, Any]) -> Dict[str, Any]:
     instructor_id = safe_int(raw.get("instructorId"), None)
     if instructor_id is None:
@@ -235,7 +260,7 @@ def normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "onlineCourses": sorted(online_course_codes),
         "arabicCourses": arabic_courses,
         "aptechCourses": [
-            normalize_course(raw, force_online=True)
+            normalize_aptech_course(raw)
             for raw in container.get("aptechCourses", [])
             if isinstance(raw, dict)
         ],
