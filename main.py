@@ -168,7 +168,7 @@ def normalize_room(raw: Dict[str, Any]) -> Dict[str, Any]:
     elif room_type == "LAB":
         room_type = "LAB_ONLY"
     elif room_type in {"PHYSICS", "PHYSICS_LAB", "PH101_LAB"}:
-        room_type = "PH101_LAB"
+        room_type = "PH101_LA"
 
     return {
         **raw,
