@@ -3209,68 +3209,67 @@ class SchedulingEngine:
 
     def _list_or_default(self, value, default: List[str]) -> List[str]:
         return list(value) if isinstance(value, list) and value else list(default)
+    def _empty_fail(self, message: str) -> dict:
+        return {
+            "success": False,
+            "message": message,
+            "scheduleUrl": self.input_data.get("scheduleUrl") or self.input_data.get("outputScheduleUrl"),
 
-def _empty_fail(self, message: str) -> dict:
-    return {
-        "success": False,
-        "message": message,
-        "scheduleUrl": self.input_data.get("scheduleUrl") or self.input_data.get("outputScheduleUrl"),
+            "courseTable": {"levels": []},
 
-        "courseTable": {"levels": []},
-
-        "collegeCourses": [],
-        "arabicCourses": [],
-        "aptechCourses": (
-            self._build_aptech_courses_output()
-            if hasattr(self, "aptech_courses")
-            else []
-        ),
-
-        "schedulesByType": {
-            "college": [],
-            "arabic": [],
-            "aptech": (
+            "collegeCourses": [],
+            "arabicCourses": [],
+            "aptechCourses": (
                 self._build_aptech_courses_output()
                 if hasattr(self, "aptech_courses")
                 else []
             ),
-        },
 
-        "optimizationSummary": {
-            "averageCampusDaysPerGroup": 0,
-            "totalGaps": 0,
-            "totalSingleSessionDays": 0,
-            "groups": [],
-        },
+            "schedulesByType": {
+                "college": [],
+                "arabic": [],
+                "aptech": (
+                    self._build_aptech_courses_output()
+                    if hasattr(self, "aptech_courses")
+                    else []
+                ),
+            },
 
-        "groupSchedules": [],
-        "studentGroupSchedules": [],
-        "instructorSchedules": [],
-        "roomSchedules": [],
+            "optimizationSummary": {
+                "averageCampusDaysPerGroup": 0,
+                "totalGaps": 0,
+                "totalSingleSessionDays": 0,
+                "groups": [],
+            },
 
-        "totalSessions": 0,
-        "totalGroups": 0,
-        "totalStudentGroups": 0,
+            "groupSchedules": [],
+            "studentGroupSchedules": [],
+            "instructorSchedules": [],
+            "roomSchedules": [],
 
-        "metadata": {
-            "unscheduledCount": 1 + len(getattr(self, "skipped_courses", {})),
+            "totalSessions": 0,
+            "totalGroups": 0,
+            "totalStudentGroups": 0,
 
-            "unscheduledReasons": [message],
+            "metadata": {
+                "unscheduledCount": 1 + len(getattr(self, "skipped_courses", {})),
 
-            "warnings": getattr(self, "warnings", []),
+                "unscheduledReasons": [message],
 
-            "conflicts": [],
+                "warnings": getattr(self, "warnings", []),
 
-            "unscheduledAptechCourses": [],
+                "conflicts": [],
 
-            "skippedCourses": [
-                {
-                    "courseCode": code,
-                    "reason": reason
-                }
-                for code, reason in sorted(
-                    getattr(self, "skipped_courses", {}).items()
-                )
-            ],
-        },
-    }
+                "unscheduledAptechCourses": [],
+
+                "skippedCourses": [
+                    {
+                        "courseCode": code,
+                        "reason": reason
+                    }
+                    for code, reason in sorted(
+                        getattr(self, "skipped_courses", {}).items()
+                    )
+                ],
+            },
+        }
