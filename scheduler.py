@@ -204,14 +204,25 @@ class SchedulingEngine:
         conflicts = self.validate_no_conflicts()
         conflicts.extend(self.validate_academic_constraints())
 
-        total_sessions = sum(len(v) for v in self.group_schedules.values())
+        aptech_session_count = sum(
+            self._safe_int(course.get("totalSessions"), 0)
+            for course in aptech_courses_output
+        )
+        total_sessions = (
+            sum(len(v) for v in self.group_schedules.values())
+            + aptech_session_count
+        )
         total_groups = len(self.group_details)
         aptech_unscheduled = [
             course
             for course in aptech_courses_output
             if course.get("status") != "SCHEDULED"
         ]
-        unscheduled_count = len(self.unscheduled_reasons) + len(self.skipped_courses)
+        unscheduled_count = (
+            len(self.unscheduled_reasons)
+            + len(self.skipped_courses)
+            + len(aptech_unscheduled)
+        )
         success = (
             not conflicts
             and unscheduled_count == 0
@@ -914,7 +925,7 @@ class SchedulingEngine:
 
                 if not is_online and course.get("labType") is not None:
                     lab_type = self._normalized_lab_type(course.get("labType"))
-                    section_count = min(
+                    section_count = max(
                         self._target_sections_count(group_size),
                         max(1, len(self.group_details.get(group_id, {}).get("sectionIds") or [])),
                     )
@@ -2867,11 +2878,15 @@ class SchedulingEngine:
                 busy.add(key)
                 seen_slots.add(key)
                 start, end = slot.split("-", 1)
+                self.session_counter += 1
                 assignments.append({
+                    "sessionId": f"SESSION_{self.session_counter:06d}",
                     "sessionType": "APTECH",
                     "courseCode": code,
                     "courseName": course_name,
                     "courseNameAr": course_name_ar,
+                    "groupId": f"APTECH-{code}-G1",
+                    "sectionId": None,
                     "level": primary_level,
                     "levels": levels,
                     "dayOfWeek": day,
@@ -2881,8 +2896,13 @@ class SchedulingEngine:
                     "instructorId": instructor_id,
                     "instructorName": instructor_name,
                     "instructorType": instructor_type,
+                    "roomId": None,
+                    "roomNumber": "ONLINE",
+                    "roomType": "ONLINE",
+                    "roomCapacity": 0,
                     "studentCount": self._safe_int(course.get("totalStudentCount"), 0),
                     "isAptech": True,
+                    "isOnline": True,
                 })
                 if max_sessions is not None and len(assignments) >= max_sessions:
                     return self._sort_aptech_sessions(assignments)
@@ -3448,6 +3468,9 @@ class SchedulingEngine:
     ) -> Optional[List[int]]:
         if section_count <= 0:
             return None
+
+        minimum_by_capacity = max(1, math.ceil(group_size / max(1, max_section_size)))
+        section_count = max(section_count, minimum_by_capacity)
 
         return self._split_evenly(group_size, section_count)
 
