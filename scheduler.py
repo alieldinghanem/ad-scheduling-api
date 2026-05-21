@@ -1478,21 +1478,50 @@ class SchedulingEngine:
 
         allocation = {code: 0 for code in shared_courses}
         remaining = slot_count
+        desired_by_course = {
+            code: self._course_desired_lecture_count(code)
+            for code in shared_courses
+        }
+        active_courses = [
+            code
+            for code in shared_courses
+            if desired_by_course.get(code, 0) > 0
+        ]
+
+        for code in sorted(
+            active_courses,
+            key=lambda item: (
+                self._other_doctor_lecture_slot_count(instructor, item),
+                -self._course_relevant_student_count(self.courses.get(item, {})),
+                item,
+            ),
+        ):
+            if remaining <= 0:
+                break
+
+            allocation[code] += 1
+            remaining -= 1
+
+        if remaining <= 0:
+            return allocation.get(course_code, 0)
+
         essential_needs = {}
 
         for code in shared_courses:
-            desired = self._course_desired_lecture_count(code)
             other_doctor_slots = self._other_doctor_lecture_slot_count(
                 instructor,
                 code,
             )
-            essential_needs[code] = max(0, desired - other_doctor_slots)
+            essential_needs[code] = max(
+                0,
+                desired_by_course.get(code, 0) - other_doctor_slots - allocation[code],
+            )
 
         for code, essential in sorted(
             essential_needs.items(),
             key=lambda item: (
-                -item[1],
                 -self._course_relevant_student_count(self.courses.get(item[0], {})),
+                -item[1],
                 item[0],
             ),
         ):
@@ -1628,33 +1657,23 @@ class SchedulingEngine:
             return {}
 
         target_capacity = self._course_lecture_group_capacity(course)
-        room_capacity = self._largest_general_room_capacity()
         total_students = sum(cleaned_counts.values())
         target_group_count = max(
             1,
             math.ceil(total_students / max(1, target_capacity)),
         )
-        room_min_group_count = max(
-            1,
-            math.ceil(total_students / max(1, room_capacity)),
-        )
         instructor_slot_count = self._course_lecture_instructor_slot_count(course)
 
         total_group_count = target_group_count
-        if (
-            instructor_slot_count > 0
-            and instructor_slot_count < target_group_count
-            and instructor_slot_count >= room_min_group_count
-        ):
-            total_group_count = instructor_slot_count
+        if instructor_slot_count > 0 and instructor_slot_count < target_group_count:
+            total_group_count = max(1, instructor_slot_count)
 
-        if len(cleaned_counts) > 1 and total_students <= room_capacity and total_group_count == 1:
+        if len(cleaned_counts) > 1 and total_group_count == 1:
             primary_level = max(cleaned_counts, key=lambda level: (cleaned_counts[level], level))
             return {primary_level: 1}
 
         per_level_min = {
-            level: max(1, math.ceil(count / max(1, room_capacity)))
-            for level, count in cleaned_counts.items()
+            level: 1 for level in cleaned_counts
         }
         per_level_target = {
             level: max(1, math.ceil(count / max(1, target_capacity)))
