@@ -14,15 +14,21 @@ BACKEND_AI_DATA_URL = os.getenv(
 app = FastAPI(title="AD Scheduling API")
 
 
+@app.get("/health")
+def health() -> Dict[str, str]:
+    return {"status": "ok"}
+
+app = FastAPI(title="AD Scheduling API")
+
+
 @app.get("/")
-def root() -> Dict[str, str]:
+def root():
     return {"message": "AD Scheduling API is running"}
 
 
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
-
 
 @app.post("/schedule")
 def generate_schedule(payload: Dict[str, Any]) -> Dict[str, Any]:
