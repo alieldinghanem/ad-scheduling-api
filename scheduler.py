@@ -313,19 +313,92 @@ class SchedulingEngine:
                 self.unscheduled_reasons.append(reason)
 
     def _schedule_section_bundles_balanced(self, demands: List[dict]) -> None:
-        by_course = defaultdict(list)
-        for demand in demands:
-            by_course[demand.get("courseCode") or ""].append(demand)
+        checkpoint = self._state_checkpoint()
+        base_unscheduled = list(self.unscheduled_reasons)
+        base_warnings = list(self.warnings)
+        attempts = []
 
-        ordered_courses = sorted(
-            by_course.values(),
-            key=lambda items: min(self._demand_priority_key(item) for item in items),
+        for strategy in ("balanced", "scarce_first", "large_first", "course_batches"):
+            self._restore_state(checkpoint)
+            self.unscheduled_reasons = list(base_unscheduled)
+            self.warnings = list(base_warnings)
+
+            if strategy == "course_batches":
+                by_course = defaultdict(list)
+                for demand in demands:
+                    by_course[demand.get("courseCode") or ""].append(demand)
+
+                ordered_courses = sorted(
+                    by_course.values(),
+                    key=lambda items: min(self._demand_priority_key(item) for item in items),
+                )
+                for course_demands in ordered_courses:
+                    self._schedule_course_section_bundles_balanced(
+                        course_demands,
+                        strategy="balanced",
+                    )
+            else:
+                self._schedule_course_section_bundles_balanced(
+                    demands,
+                    strategy=strategy,
+                )
+
+            attempts.append((
+                self._section_attempt_score(
+                    len(base_unscheduled),
+                    len(base_warnings),
+                ),
+                self._state_checkpoint(),
+                list(self.unscheduled_reasons),
+                list(self.warnings),
+            ))
+
+        _, best_state, best_unscheduled, best_warnings = max(
+            attempts,
+            key=lambda item: item[0],
+        )
+        self._restore_state(best_state)
+        self.unscheduled_reasons = best_unscheduled
+        self.warnings = best_warnings
+
+    def _section_attempt_score(
+        self,
+        base_unscheduled_count: int,
+        base_warning_count: int,
+    ) -> Tuple[int, int, int, int]:
+        new_unscheduled = self.unscheduled_reasons[base_unscheduled_count:]
+        new_warnings = self.warnings[base_warning_count:]
+        zero_section_count = sum(
+            1
+            for reason in new_unscheduled
+            if "Only 0 sections scheduled" in reason
+            or "No TA/instructor" in reason
+            or "No suitable rooms" in reason
+        )
+        partial_warning_count = sum(
+            1
+            for warning in new_warnings
+            if "Only " in warning and " sections scheduled" in warning
+        )
+        scheduled_sections = sum(
+            1
+            for sessions in self.group_schedules.values()
+            for session in sessions
+            if session.get("sessionType") == "SECTION"
         )
 
-        for course_demands in ordered_courses:
-            self._schedule_course_section_bundles_balanced(course_demands)
+        return (
+            -zero_section_count,
+            scheduled_sections,
+            -partial_warning_count,
+            -len(new_unscheduled) - len(new_warnings),
+        )
 
-    def _schedule_course_section_bundles_balanced(self, demands: List[dict]) -> None:
+    def _schedule_course_section_bundles_balanced(
+        self,
+        demands: List[dict],
+        strategy: str = "balanced",
+    ) -> None:
         states = []
 
         for demand in demands:
@@ -378,7 +451,7 @@ class SchedulingEngine:
                 break
 
             progress = False
-            active.sort(key=self._section_state_priority_key)
+            active.sort(key=lambda state: self._section_state_priority_key(state, strategy))
 
             for state in active:
                 if state["blocked"] or state["scheduled"] >= len(state["sectionSizes"]):
@@ -421,14 +494,46 @@ class SchedulingEngine:
                     )
                 )
 
-    def _section_state_priority_key(self, state: dict) -> Tuple[int, int, int, int, str, str]:
+    def _section_state_priority_key(
+        self,
+        state: dict,
+        strategy: str = "balanced",
+    ) -> Tuple[int, int, int, int, int, str, str]:
         demand = state["demand"]
         remaining = len(state["sectionSizes"]) - state["scheduled"]
+        placements = self._demand_candidate_placement_count(demand)
+        course_total_students = self._course_total_student_count(
+            self.courses.get(demand.get("courseCode") or "", {})
+        )
+
+        if strategy == "scarce_first":
+            return (
+                placements,
+                state["scheduled"],
+                -remaining,
+                -self._safe_int(demand.get("groupSize"), 0),
+                -course_total_students,
+                demand.get("courseCode") or "",
+                demand.get("groupId") or "",
+            )
+
+        if strategy == "large_first":
+            return (
+                state["scheduled"],
+                -self._safe_int(demand.get("groupSize"), 0),
+                placements,
+                -remaining,
+                -course_total_students,
+                demand.get("courseCode") or "",
+                demand.get("groupId") or "",
+            )
+
         return (
             state["scheduled"],
-            self._demand_candidate_placement_count(demand),
+            placements,
             -remaining,
             -self._safe_int(demand.get("groupSize"), 0),
+            -course_total_students,
             demand.get("courseCode") or "",
             demand.get("groupId") or "",
         )
