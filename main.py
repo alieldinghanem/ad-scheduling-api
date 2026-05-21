@@ -36,7 +36,12 @@ def safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def normalize_course(raw: Dict[str, Any], force_online: bool = False) -> Dict[str, Any]:
+def normalize_course(
+    raw: Dict[str, Any],
+    force_online: bool = False,
+    force_arabic_online: bool | None = None,
+    force_aptech: bool = False,
+) -> Dict[str, Any]:
     code = str(raw.get("courseCode") or raw.get("code") or "").strip().upper()
     if not code:
         raise ValueError("Course is missing courseCode")
@@ -58,6 +63,12 @@ def normalize_course(raw: Dict[str, Any], force_online: bool = False) -> Dict[st
 
     if not isinstance(departments, list):
         departments = [departments]
+
+    is_arabic_online = bool(raw.get("isArabicOnline") or code in DEFAULT_ONLINE_COURSES)
+    if force_arabic_online is not None:
+        is_arabic_online = force_arabic_online
+
+    is_online = bool(raw.get("isOnline") or force_online or is_arabic_online)
 
     return {
         **raw,
@@ -82,7 +93,9 @@ def normalize_course(raw: Dict[str, Any], force_online: bool = False) -> Dict[st
         "studentBreakdown": raw.get("studentBreakdown") if isinstance(raw.get("studentBreakdown"), list) else [],
         "instructorIds": raw.get("instructorIds") if isinstance(raw.get("instructorIds"), list) else [],
         "labType": lab_type,
-        "isArabicOnline": bool(raw.get("isArabicOnline") or force_online or code in DEFAULT_ONLINE_COURSES),
+        "isOnline": is_online,
+        "isArabicOnline": is_arabic_online,
+        "isAptech": bool(raw.get("isAptech") or force_aptech),
         "lectureDurationMinutes": safe_int(
             raw.get("lectureDurationMinutes"),
             SPECIAL_LECTURE_DURATIONS.get(code, DEFAULT_LECTURE_DURATION_MINUTES),
@@ -91,31 +104,6 @@ def normalize_course(raw: Dict[str, Any], force_online: bool = False) -> Dict[st
             raw.get("sectionDurationMinutes"),
             SPECIAL_SECTION_DURATIONS.get(code, DEFAULT_SECTION_DURATION_MINUTES),
         ),
-    }
-
-
-def normalize_aptech_course(raw: Dict[str, Any]) -> Dict[str, Any]:
-    code = str(raw.get("courseCode") or raw.get("code") or "").strip().upper()
-    if not code:
-        raise ValueError("Aptech course is missing courseCode")
-
-    levels = raw.get("levels")
-    if levels is None:
-        levels = [safe_int(raw.get("level", 1), 1)]
-    if not isinstance(levels, list):
-        levels = [levels]
-
-    return {
-        **raw,
-        "courseCode": code,
-        "courseName": raw.get("courseName") or code,
-        "levels": [safe_int(value, 1) for value in levels],
-        "totalStudentCount": safe_int(
-            raw.get("totalStudentCount", raw.get("enrollmentCount")),
-            0,
-        ),
-        "studentBreakdown": raw.get("studentBreakdown") if isinstance(raw.get("studentBreakdown"), list) else [],
-        "availabilities": raw.get("availabilities") if isinstance(raw.get("availabilities"), list) else [],
     }
 
 
@@ -202,7 +190,7 @@ def normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
                 courses.append(normalize_course(raw, force_online=True))
 
     arabic_courses = [
-        normalize_course(raw, force_online=True)
+        normalize_course(raw, force_online=True, force_arabic_online=True)
         for raw in container.get("arabicCourses", [])
         if isinstance(raw, dict)
     ]
@@ -260,7 +248,12 @@ def normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "onlineCourses": sorted(online_course_codes),
         "arabicCourses": arabic_courses,
         "aptechCourses": [
-            normalize_aptech_course(raw)
+            normalize_course(
+                raw,
+                force_online=True,
+                force_arabic_online=False,
+                force_aptech=True,
+            )
             for raw in container.get("aptechCourses", [])
             if isinstance(raw, dict)
         ],
