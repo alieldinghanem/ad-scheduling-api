@@ -365,9 +365,10 @@ class SchedulingEngine:
         self,
         base_unscheduled_count: int,
         base_warning_count: int,
-    ) -> Tuple[int, int, int, int]:
+    ) -> Tuple[int, int, int, int, int]:
         new_unscheduled = self.unscheduled_reasons[base_unscheduled_count:]
         new_warnings = self.warnings[base_warning_count:]
+        conflict_count = len(self.validate_no_conflicts())
         zero_section_count = sum(
             1
             for reason in new_unscheduled
@@ -388,6 +389,7 @@ class SchedulingEngine:
         )
 
         return (
+            -conflict_count,
             -zero_section_count,
             scheduled_sections,
             -partial_warning_count,
@@ -986,6 +988,10 @@ class SchedulingEngine:
                 continue
 
             is_online = self._is_online_course(course)
+            if not is_online and self._course_relevant_student_count(course) <= 0:
+                self.warnings.append(f"Skipped {code} schedule because totalStudentCount is 0.")
+                continue
+
             group_ids = self._target_group_ids_for_course(code, course)
 
             if not is_online and course.get("labType") is not None and group_ids:
@@ -1754,7 +1760,7 @@ class SchedulingEngine:
             return {level: max(1, total_group_count)}
 
         if sum(per_level_min.values()) > total_group_count:
-            return per_level_target
+            return per_level_min
 
         allocation = dict(per_level_min)
         remaining = total_group_count - sum(allocation.values())
@@ -4022,7 +4028,14 @@ class SchedulingEngine:
                 )
                 for code, count in course_counts.items()
             }
-            lecture_group_count = max(1, max(course_group_counts.values(), default=1))
+            level_group_count = max(
+                1,
+                math.ceil(max_students / max(1, self.max_lecture_group_size)),
+            )
+            lecture_group_count = max(
+                level_group_count,
+                max(course_group_counts.values(), default=1),
+            )
             lecture_group_sizes = self._split_evenly(max_students, lecture_group_count)
 
             for group_index, group_size in enumerate(lecture_group_sizes, start=1):
@@ -4295,19 +4308,28 @@ class SchedulingEngine:
     def _course_level_student_counts(self, course: dict) -> Dict[int, int]:
         levels = self._normalize_levels(course)
         breakdown = self._normalize_student_breakdown(course.get("studentBreakdown"))
-        counts = {level: 0 for level in levels}
+        counts = defaultdict(int)
 
         for row in breakdown:
             level = self._safe_int(row.get("level"), None)
-            if level in counts:
-                counts[level] += self._safe_int(row.get("studentCount"), 0)
+            if level is None or level <= 0:
+                level = levels[0] if levels else 1
+
+            counts[level] += self._safe_int(row.get("studentCount"), 0)
 
         if any(counts.values()):
-            return {level: count for level, count in counts.items() if count > 0}
+            return {
+                level: count
+                for level, count in sorted(counts.items())
+                if count > 0
+            }
 
         total = self._safe_int(course.get("totalStudentCount"), 0)
         if total <= 0:
             return {}
+
+        if not levels:
+            levels = [1]
 
         sizes = self._split_evenly(total, len(levels))
         return {
