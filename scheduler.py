@@ -1400,13 +1400,20 @@ class SchedulingEngine:
                 if room.get("roomType") in {"PH101_LAB", "PH101_LA"}
             ]
 
-        else:
+        elif lab_type == "GENERAL_LAB":
             candidates = [
                 room
                 for room in rooms
                 if room.get("roomType") in {"GENERAL", "LAB_ONLY"}
             ]
             candidates = self._general_section_room_order(candidates)
+
+        else:
+            candidates = [
+                room
+                for room in rooms
+                if room.get("roomType") == "LAB_ONLY"
+            ]
 
         return [
             room
