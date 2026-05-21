@@ -580,7 +580,7 @@ class SchedulingEngine:
             "labType": lab_type,
         }
 
-    def _demand_priority_key(self, demand: dict) -> Tuple[int, int, int, int, int, str, str]:
+    def _demand_priority_key(self, demand: dict) -> Tuple:
         placements = self._demand_candidate_placement_count(demand)
         if placements <= 0:
             placements = 999_999
@@ -588,9 +588,21 @@ class SchedulingEngine:
         course_code = demand.get("courseCode") or ""
         session_type = demand.get("sessionType") or ""
         already_scheduled = self._scheduled_course_session_count(course_code, session_type)
-        course_total_students = self._course_total_student_count(self.courses.get(course_code, {}))
+        course = self.courses.get(course_code, {})
+        course_total_students = self._course_total_student_count(course)
+        fairness_priority = 0
+
+        if (
+            demand.get("kind") == "LECTURE"
+            and session_type == "LECTURE"
+            and not demand.get("isOnline")
+        ):
+            reserved_lectures = self._course_lecture_instructor_slot_count(course)
+            if reserved_lectures > 0 and already_scheduled >= reserved_lectures:
+                fairness_priority = 1
 
         return (
+            fairness_priority,
             placements,
             -course_total_students,
             already_scheduled,
@@ -1304,6 +1316,22 @@ class SchedulingEngine:
                     if not self._can_use_instructor(instructor, day, slot, demand):
                         continue
 
+                    instructor_id = instructor.get("instructorId")
+                    course_section_count = sum(
+                        1
+                        for session in self.instructor_schedules.get(instructor_id, [])
+                        if session.get("courseCode") == demand["courseCode"]
+                        and session.get("sessionType") == "SECTION"
+                    )
+                    course_slot_share = self._instructor_course_section_slot_share(
+                        instructor,
+                        demand["courseCode"],
+                    )
+                    over_preferred_share = (
+                        course_slot_share <= 0
+                        or course_section_count >= course_slot_share
+                    )
+
                     for room in self._least_busy_rooms(rooms):
                         if self._safe_int(room.get("capacity"), 0) < demand["studentCount"]:
                             continue
@@ -1320,12 +1348,14 @@ class SchedulingEngine:
                             candidates.append((
                                 (
                                     general_section_room_priority,
+                                    1 if over_preferred_share else 0,
+                                    course_section_count,
+                                    len(self.instructor_schedules.get(instructor_id, [])),
                                     len(self.room_schedules.get(room.get("roomId"), [])),
-                                    len(self.instructor_schedules.get(instructor.get("instructorId"), [])),
                                     day_order.get(day, 999),
                                     slot_order.get(slot, 999),
                                     room.get("roomId") or 0,
-                                    instructor.get("instructorId") or 0,
+                                    instructor_id or 0,
                                 ),
                                 instructor,
                                 room,
@@ -1681,6 +1711,106 @@ class SchedulingEngine:
 
         return max(1, by_size)
 
+    def _course_desired_section_count(self, course_code: str) -> int:
+        course = self.courses.get(course_code, {})
+        if (
+            not course
+            or course.get("labType") is None
+            or self._is_online_course(course)
+            or self._is_display_only_course(course)
+            or self._is_project_course(course)
+        ):
+            return 0
+
+        total = 0
+        for group_id in self._target_group_ids_for_course(course_code, course):
+            group_size = self._course_group_size(course_code, group_id)
+            if group_size <= 0:
+                continue
+
+            total += max(
+                self._target_sections_count(group_size),
+                max(1, len(self.group_details.get(group_id, {}).get("sectionIds") or [])),
+            )
+
+        return total
+
+    def _instructor_regular_section_slot_count(
+        self,
+        instructor: dict,
+        course_code: str,
+    ) -> int:
+        slots = self._preferred_slots_for_course(course_code, "SECTION")
+        return sum(
+            1
+            for day in self.days
+            for slot in slots
+            if self._is_instructor_available(instructor, day, slot)
+        )
+
+    def _instructor_course_section_slot_share(
+        self,
+        instructor: dict,
+        course_code: str,
+    ) -> int:
+        shared_courses = self._schedulable_section_courses_for_instructor(instructor)
+        if course_code not in shared_courses:
+            return 0
+
+        slot_count = self._instructor_regular_section_slot_count(instructor, course_code)
+        if slot_count <= 0:
+            return 0
+
+        allocation = {code: 0 for code in shared_courses}
+        remaining = slot_count
+        desired_by_course = {
+            code: self._course_desired_section_count(code)
+            for code in shared_courses
+        }
+        active_courses = [
+            code
+            for code in shared_courses
+            if desired_by_course.get(code, 0) > 0
+        ]
+
+        for code in sorted(
+            active_courses,
+            key=lambda item: (
+                -self._course_relevant_student_count(self.courses.get(item, {})),
+                item,
+            ),
+        ):
+            if remaining <= 0:
+                break
+
+            allocation[code] += 1
+            remaining -= 1
+
+        if remaining <= 0:
+            return allocation.get(course_code, 0)
+
+        needs = {
+            code: max(0, desired_by_course.get(code, 0) - allocation[code])
+            for code in active_courses
+        }
+
+        for code, need in sorted(
+            needs.items(),
+            key=lambda item: (
+                -item[1],
+                -self._course_relevant_student_count(self.courses.get(item[0], {})),
+                item[0],
+            ),
+        ):
+            if remaining <= 0:
+                break
+
+            assigned = min(need, remaining)
+            allocation[code] += assigned
+            remaining -= assigned
+
+        return allocation.get(course_code, 0)
+
     def _schedulable_lecture_courses_for_instructor(self, instructor: dict) -> List[str]:
         instructor_id = instructor.get("instructorId")
         assigned_codes = self._assigned_course_codes(instructor)
@@ -1689,6 +1819,36 @@ class SchedulingEngine:
         for code, course in self.courses.items():
             if (
                 code in self.blocked_courses
+                or self._is_online_course(course)
+                or self._is_display_only_course(course)
+                or self._is_project_course(course)
+                or self._course_total_student_count(course) <= 0
+            ):
+                continue
+
+            course_instructor_ids = set(course.get("instructorIds") or [])
+            if code not in assigned_codes and instructor_id not in course_instructor_ids:
+                continue
+
+            if not self._instructor_matches_course_category(instructor, course):
+                continue
+
+            result.append(code)
+
+        return result
+
+    def _schedulable_section_courses_for_instructor(self, instructor: dict) -> List[str]:
+        if instructor.get("instructorType") != "TA":
+            return []
+
+        instructor_id = instructor.get("instructorId")
+        assigned_codes = self._assigned_course_codes(instructor)
+        result = []
+
+        for code, course in self.courses.items():
+            if (
+                code in self.blocked_courses
+                or course.get("labType") is None
                 or self._is_online_course(course)
                 or self._is_display_only_course(course)
                 or self._is_project_course(course)
@@ -2542,6 +2702,7 @@ class SchedulingEngine:
             if self._is_project_course(course):
                 total_student_count = total_student_count or session_student_count
                 primary_student_count = primary_student_count or session_student_count
+            status = self._course_schedule_status(code, course, sessions)
 
             result.append({
                 "courseCode": code,
@@ -2559,10 +2720,59 @@ class SchedulingEngine:
                 ),
                 "sessions": self._sort_sessions(sessions),
                 "totalSessions": len(sessions),
-                "status": "SCHEDULED" if sessions else "UNSCHEDULED",
+                "status": status,
             })
 
         return sorted(result, key=self._course_output_sort_key)
+
+    def _course_schedule_status(
+        self,
+        course_code: str,
+        course: dict,
+        sessions: List[dict],
+    ) -> str:
+        if not sessions:
+            return "UNSCHEDULED"
+
+        if self._is_project_course(course):
+            return "SCHEDULED"
+
+        if course.get("isArabicOnline") is True or self._is_online_course(course):
+            return "SCHEDULED"
+
+        target_group_ids = self._target_group_ids_for_course(course_code, course)
+        expected_lectures = {
+            group_id
+            for group_id in target_group_ids
+            if self._course_group_size(course_code, group_id) > 0
+        }
+        scheduled_lectures = {
+            session.get("groupId")
+            for session in sessions
+            if session.get("sessionType") == "LECTURE"
+        }
+
+        if expected_lectures and not expected_lectures.issubset(scheduled_lectures):
+            return "PARTIAL"
+
+        if course.get("labType") is not None:
+            expected_sections = 0
+            for group_id in expected_lectures:
+                group_size = self._course_group_size(course_code, group_id)
+                expected_sections += max(
+                    self._target_sections_count(group_size),
+                    max(1, len(self.group_details.get(group_id, {}).get("sectionIds") or [])),
+                )
+
+            scheduled_sections = sum(
+                1
+                for session in sessions
+                if session.get("sessionType") == "SECTION"
+            )
+            if scheduled_sections < expected_sections:
+                return "PARTIAL"
+
+        return "SCHEDULED"
 
     def _simplify_courses_output(self, courses: List[dict]) -> List[dict]:
         return [
