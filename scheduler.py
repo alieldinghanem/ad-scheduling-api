@@ -1355,20 +1355,24 @@ class SchedulingEngine:
                 for room in rooms
                 if room.get("roomType") in {"GENERAL", "LAB_ONLY"}
             ]
-            candidates.sort(
-                key=lambda room: (
-                    0 if room.get("roomType") == "GENERAL" else 1,
-                    len(self.room_schedules.get(room.get("roomId"), [])),
-                    -self._safe_int(room.get("capacity"), 0),
-                    room.get("roomId") or 0,
-                )
-            )
+            candidates = self._general_section_room_order(candidates)
 
         return [
             room
             for room in candidates
             if self._safe_int(room.get("capacity"), 0) >= max(1, student_count)
         ]
+
+    def _general_section_room_order(self, rooms: List[dict]) -> List[dict]:
+        return sorted(
+            rooms,
+            key=lambda room: (
+                0 if room.get("roomType") == "GENERAL" else 1,
+                len(self.room_schedules.get(room.get("roomId"), [])),
+                -self._safe_int(room.get("capacity"), 0),
+                room.get("roomId") or 0,
+            ),
+        )
 
     def _get_lecture_room_candidates(
         self,
