@@ -195,12 +195,6 @@ class SchedulingEngine:
         self._schedule_demands(lecture_demands)
         self._schedule_demands(section_demands)
         self._schedule_demands(online_demands)
-
-        # Final repair pass: after the first greedy placement, try again to place
-        # any missing lectures/sections using the remaining free staff/room slots.
-        # This improves completeness without breaking hard constraints.
-        self._repair_remaining_demands(lecture_demands, section_demands, online_demands)
-
         self._schedule_arabic_online_courses()
         self._schedule_project_courses()
 
@@ -210,14 +204,25 @@ class SchedulingEngine:
         conflicts = self.validate_no_conflicts()
         conflicts.extend(self.validate_academic_constraints())
 
-        total_sessions = sum(len(v) for v in self.group_schedules.values())
+        aptech_session_count = sum(
+            self._safe_int(course.get("totalSessions"), 0)
+            for course in aptech_courses_output
+        )
+        total_sessions = (
+            sum(len(v) for v in self.group_schedules.values())
+            + aptech_session_count
+        )
         total_groups = len(self.group_details)
         aptech_unscheduled = [
             course
             for course in aptech_courses_output
             if course.get("status") != "SCHEDULED"
         ]
-        unscheduled_count = len(self.unscheduled_reasons) + len(self.skipped_courses)
+        unscheduled_count = (
+            len(self.unscheduled_reasons)
+            + len(self.skipped_courses)
+            + len(aptech_unscheduled)
+        )
         success = (
             not conflicts
             and unscheduled_count == 0
@@ -286,145 +291,6 @@ class SchedulingEngine:
                 ],
             },
         }
-
-
-    def _repair_remaining_demands(
-        self,
-        lecture_demands: List[dict],
-        section_demands: List[dict],
-        online_demands: List[dict],
-    ) -> None:
-        """Try to complete missing sessions after the first greedy pass.
-
-        The first pass is intentionally fast and safe, but it may leave a lecture
-        unscheduled even though a later free staff/room combination still exists.
-        This repair pass does not move existing sessions; it only fills missing
-        sessions where all hard constraints can still be satisfied.
-        """
-        all_lecture_demands = list(lecture_demands or []) + list(online_demands or [])
-
-        for _ in range(3):
-            progress = False
-
-            missing_lectures = [
-                demand
-                for demand in all_lecture_demands
-                if not self._lecture_demand_is_scheduled(demand)
-            ]
-            missing_lectures.sort(key=self._demand_priority_key)
-
-            for demand in missing_lectures:
-                demand.pop("_reason_added", None)
-                if self._schedule_single_session(demand):
-                    progress = True
-
-            missing_sections = [
-                demand
-                for demand in section_demands or []
-                if self._section_bundle_scheduled_count(demand) < max(1, demand.get("minSections", 1))
-            ]
-            missing_sections.sort(key=self._demand_priority_key)
-
-            for demand in missing_sections:
-                if self._repair_section_bundle(demand):
-                    progress = True
-
-            if not progress:
-                break
-
-        self._rebuild_unscheduled_reasons(lecture_demands, section_demands, online_demands)
-
-    def _lecture_demand_is_scheduled(self, demand: dict) -> bool:
-        return any(
-            session.get("courseCode") == demand.get("courseCode")
-            and session.get("groupId") == demand.get("groupId")
-            and session.get("sessionType") == "LECTURE"
-            for session in self.group_schedules.get(demand.get("groupId"), [])
-        )
-
-    def _section_bundle_scheduled_count(self, demand: dict) -> int:
-        return sum(
-            1
-            for session in self.group_schedules.get(demand.get("groupId"), [])
-            if session.get("courseCode") == demand.get("courseCode")
-            and session.get("sessionType") == "SECTION"
-            and session.get("sectionId")
-        )
-
-    def _repair_section_bundle(self, demand: dict) -> bool:
-        course_code = demand["courseCode"]
-        group_id = demand["groupId"]
-        target = max(1, self._safe_int(demand.get("targetSections"), 1))
-        scheduled = self._section_bundle_scheduled_count(demand)
-
-        if scheduled >= target:
-            return False
-
-        section_sizes = self._distribute_group_to_sections(
-            demand["groupSize"],
-            target,
-            self.max_section_size,
-        ) or []
-        if not section_sizes:
-            return False
-
-        instructors = self._get_matching_instructors(course_code, "SECTION")
-        rooms = self._get_matching_rooms("SECTION", demand.get("labType"), 1, False)
-        if not instructors or not rooms:
-            return False
-
-        progress = False
-        for index in range(scheduled + 1, target + 1):
-            section_size = section_sizes[index - 1] if index - 1 < len(section_sizes) else section_sizes[-1]
-            section_demand = self._build_section_demand(
-                demand,
-                index,
-                section_size,
-                demand.get("labType"),
-            )
-            section_demand.pop("_reason_added", None)
-
-            if self._schedule_one_section(section_demand, instructors, rooms):
-                progress = True
-                continue
-
-            if demand.get("labType") == "LAB_ONLY":
-                fallback_rooms = self._get_matching_rooms("SECTION", "GENERAL_LAB", 1, False)
-                if fallback_rooms and self._schedule_one_section(
-                    {**section_demand, "labType": "GENERAL_LAB"},
-                    instructors,
-                    fallback_rooms,
-                ):
-                    progress = True
-
-        return progress
-
-    def _rebuild_unscheduled_reasons(
-        self,
-        lecture_demands: List[dict],
-        section_demands: List[dict],
-        online_demands: List[dict],
-    ) -> None:
-        rebuilt = []
-
-        for demand in list(lecture_demands or []) + list(online_demands or []):
-            if not self._lecture_demand_is_scheduled(demand):
-                rebuilt.append(self._diagnose_unscheduled_demand(demand))
-
-        for demand in section_demands or []:
-            scheduled = self._section_bundle_scheduled_count(demand)
-            target = max(1, self._safe_int(demand.get("targetSections"), 1))
-            minimum = max(1, self._safe_int(demand.get("minSections"), 1))
-            if scheduled < minimum:
-                rebuilt.append(
-                    self._diagnose_partial_sections(demand, scheduled, target, minimum)
-                )
-            elif scheduled < target:
-                warning = self._diagnose_partial_sections(demand, scheduled, target, minimum)
-                if warning not in self.warnings:
-                    self.warnings.append(warning)
-
-        self.unscheduled_reasons = list(dict.fromkeys(rebuilt))
 
     def _schedule_demands(self, demands: List[dict]) -> None:
         pending = list(demands)
@@ -1059,7 +925,7 @@ class SchedulingEngine:
 
                 if not is_online and course.get("labType") is not None:
                     lab_type = self._normalized_lab_type(course.get("labType"))
-                    section_count = min(
+                    section_count = max(
                         self._target_sections_count(group_size),
                         max(1, len(self.group_details.get(group_id, {}).get("sectionIds") or [])),
                     )
@@ -1360,6 +1226,9 @@ class SchedulingEngine:
         section_id = demand["sectionId"]
 
         slots = self._preferred_slots_for_course(demand["courseCode"], "SECTION")
+        day_order = {day: index for index, day in enumerate(self.days)}
+        slot_order = {slot: index for index, slot in enumerate(slots)}
+        candidates = []
 
         for day in self._preferred_days_for_group(group_id):
             for slot in self._preferred_slots_for_group_on_day(group_id, day, slots):
@@ -1383,13 +1252,38 @@ class SchedulingEngine:
                             continue
 
                         if self._can_use_room(room, day, slot):
-                            session = self._create_scheduled_session(
-                                demand, instructor, room, day, slot
+                            general_section_room_priority = (
+                                0
+                                if (
+                                    demand.get("labType") == "GENERAL_LAB"
+                                    and room.get("roomType") == "GENERAL"
+                                )
+                                else 1
                             )
-                            self._place_session(group_id, session)
-                            return True
+                            candidates.append((
+                                (
+                                    general_section_room_priority,
+                                    len(self.room_schedules.get(room.get("roomId"), [])),
+                                    len(self.instructor_schedules.get(instructor.get("instructorId"), [])),
+                                    day_order.get(day, 999),
+                                    slot_order.get(slot, 999),
+                                    room.get("roomId") or 0,
+                                    instructor.get("instructorId") or 0,
+                                ),
+                                instructor,
+                                room,
+                                day,
+                                slot,
+                            ))
 
-        return False
+        if not candidates:
+            return False
+
+        _, instructor, room, day, slot = min(candidates, key=lambda item: item[0])
+        session = self._create_scheduled_session(demand, instructor, room, day, slot)
+        self._place_session(group_id, session)
+        return True
+
 
     def _get_matching_instructors(self, course_code: str, session_type: str) -> List[dict]:
         course = self.courses.get(course_code, {})
@@ -1461,6 +1355,14 @@ class SchedulingEngine:
                 for room in rooms
                 if room.get("roomType") in {"GENERAL", "LAB_ONLY"}
             ]
+            candidates.sort(
+                key=lambda room: (
+                    0 if room.get("roomType") == "GENERAL" else 1,
+                    len(self.room_schedules.get(room.get("roomId"), [])),
+                    -self._safe_int(room.get("capacity"), 0),
+                    room.get("roomId") or 0,
+                )
+            )
 
         return [
             room
@@ -3012,11 +2914,15 @@ class SchedulingEngine:
                 busy.add(key)
                 seen_slots.add(key)
                 start, end = slot.split("-", 1)
+                self.session_counter += 1
                 assignments.append({
+                    "sessionId": f"SESSION_{self.session_counter:06d}",
                     "sessionType": "APTECH",
                     "courseCode": code,
                     "courseName": course_name,
                     "courseNameAr": course_name_ar,
+                    "groupId": f"APTECH-{code}-G1",
+                    "sectionId": None,
                     "level": primary_level,
                     "levels": levels,
                     "dayOfWeek": day,
@@ -3026,8 +2932,13 @@ class SchedulingEngine:
                     "instructorId": instructor_id,
                     "instructorName": instructor_name,
                     "instructorType": instructor_type,
+                    "roomId": None,
+                    "roomNumber": "ONLINE",
+                    "roomType": "ONLINE",
+                    "roomCapacity": 0,
                     "studentCount": self._safe_int(course.get("totalStudentCount"), 0),
                     "isAptech": True,
+                    "isOnline": True,
                 })
                 if max_sessions is not None and len(assignments) >= max_sessions:
                     return self._sort_aptech_sessions(assignments)
@@ -3535,8 +3446,7 @@ class SchedulingEngine:
         return (
             course.get("isArabicOnline") is True
             or self._is_project_course(course)
-            or
-            course.get("labType") is None
+            or course.get("isOnline") is True
             or self._course_code(course) in self.online_course_codes
         )
 
@@ -3593,6 +3503,9 @@ class SchedulingEngine:
     ) -> Optional[List[int]]:
         if section_count <= 0:
             return None
+
+        minimum_by_capacity = max(1, math.ceil(group_size / max(1, max_section_size)))
+        section_count = max(section_count, minimum_by_capacity)
 
         return self._split_evenly(group_size, section_count)
 
