@@ -451,17 +451,6 @@ class SchedulingEngine:
             state["scheduled"] += 1
             return True
 
-        if demand.get("labType") == "LAB_ONLY":
-            fallback_rooms = self._get_matching_rooms("SECTION", "GENERAL_LAB", 1, False)
-            if fallback_rooms and self._schedule_one_section(
-                {**section_demand, "labType": "GENERAL_LAB"},
-                state["instructors"],
-                fallback_rooms,
-            ):
-                state["scheduled"] += 1
-                state["fallbackUsed"] = True
-                return True
-
         return False
 
     def _build_section_demand(
@@ -1150,49 +1139,6 @@ class SchedulingEngine:
                 scheduled += 1
 
         if scheduled <= 0:
-            fallback_rooms = []
-            if demand.get("labType") == "LAB_ONLY":
-                fallback_rooms = self._get_matching_rooms("SECTION", "GENERAL_LAB", 1, False)
-
-            if fallback_rooms:
-                self._restore_state(checkpoint)
-                scheduled = 0
-
-                for index, section_size in enumerate(section_sizes, start=1):
-                    section_id = self._section_label(group_id, index)
-
-                    section_demand = {
-                        "kind": "SECTION",
-                        "sessionType": "SECTION",
-                        "courseCode": course_code,
-                        "courseName": demand["courseName"],
-                        "groupId": group_id,
-                        "studentCount": section_size,
-                        "sectionId": section_id,
-                        "isOnline": False,
-                        "labType": "GENERAL_LAB",
-                    }
-
-                    if self._schedule_one_section(section_demand, instructors, fallback_rooms):
-                        scheduled += 1
-
-                if scheduled > 0:
-                    self.warnings.append(
-                        f"Used a general room fallback for {course_code} sections group={group_id} because lab rooms were not enough."
-                    )
-
-                    if scheduled != len(section_sizes):
-                        self.warnings.append(
-                            self._diagnose_partial_sections(
-                                demand,
-                                scheduled,
-                                len(section_sizes),
-                                max(1, demand.get("minSections", 1)),
-                            )
-                        )
-
-                    return True
-
             self._restore_state(checkpoint)
             return self._add_unscheduled(
                 demand,
@@ -3824,7 +3770,7 @@ class SchedulingEngine:
             return "PROJECT"
 
         if lab_type not in {"LAB_ONLY", "GENERAL_LAB", "PH101_LA", "PROJECT"}:
-            return "GENERAL_LAB"
+            return "LAB_ONLY"
 
         return lab_type
 
