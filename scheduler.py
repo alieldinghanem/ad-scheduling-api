@@ -319,7 +319,7 @@ class SchedulingEngine:
         base_warnings = list(self.warnings)
         attempts = []
 
-        for strategy in ("balanced", "scarce_first", "large_first", "course_batches"):
+       for strategy in ("balanced",):
             self._restore_state(checkpoint)
             self.unscheduled_reasons = list(base_unscheduled)
             self.warnings = list(base_warnings)
