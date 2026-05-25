@@ -279,9 +279,9 @@ def is_url(value: str) -> bool:
     return value.lower().startswith(("http://", "https://"))
 
 
-def load_json_from_url(url: str) -> Dict[str, Any]:
+def load_json_from_url(url: str, timeout: int = 60) -> Dict[str, Any]:
     request = Request(url, headers={"Accept": "application/json"})
-    with urlopen(request, timeout=60) as response:
+    with urlopen(request, timeout=timeout) as response:
         charset = response.headers.get_content_charset() or "utf-8"
         return json.loads(response.read().decode(charset))
 
