@@ -276,7 +276,13 @@ def get_latest_schedule() -> Dict[str, Any]:
 
 
 @app.get("/schedule/from-backend")
-def generate_schedule_from_backend() -> Dict[str, Any]:
+def generate_schedule_from_backend(refresh: bool = False) -> Dict[str, Any]:
+    if not refresh:
+        try:
+            return _load_latest_schedule()
+        except HTTPException:
+            pass
+
     started = time.perf_counter()
     try:
         payload = load_json_from_url(
