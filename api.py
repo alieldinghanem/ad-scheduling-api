@@ -1,8 +1,10 @@
 import multiprocessing as mp
+import json
 import os
 import queue
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
 from threading import Lock
 from typing import Any, Dict
 from uuid import uuid4
@@ -17,8 +19,9 @@ BACKEND_AI_DATA_URL = os.getenv(
     "https://nub-adex.runasp.net/api/Scheduling/ai-data",
 )
 BACKEND_FETCH_TIMEOUT_SECONDS = int(os.getenv("BACKEND_FETCH_TIMEOUT_SECONDS", "60"))
-SCHEDULER_TIMEOUT_SECONDS = int(os.getenv("SCHEDULER_TIMEOUT_SECONDS", "240"))
+SCHEDULER_TIMEOUT_SECONDS = int(os.getenv("SCHEDULER_TIMEOUT_SECONDS", "1200"))
 SCHEDULER_JOB_WORKERS = int(os.getenv("SCHEDULER_JOB_WORKERS", "1"))
+LATEST_SCHEDULE_FILE = Path(os.getenv("LATEST_SCHEDULE_FILE", "latest_schedule.json"))
 
 app = FastAPI(title="AD Scheduling API")
 job_executor = ThreadPoolExecutor(max_workers=max(1, SCHEDULER_JOB_WORKERS))
@@ -91,6 +94,27 @@ def _payload_counts(payload: Dict[str, Any]) -> Dict[str, int]:
     }
 
 
+def _save_latest_schedule(result: Dict[str, Any]) -> None:
+    temp_path = LATEST_SCHEDULE_FILE.with_suffix(".tmp")
+    with temp_path.open("w", encoding="utf-8") as file:
+        json.dump(result, file, ensure_ascii=False)
+    temp_path.replace(LATEST_SCHEDULE_FILE)
+
+
+def _load_latest_schedule() -> Dict[str, Any]:
+    if not LATEST_SCHEDULE_FILE.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "No schedule has been generated yet. "
+                "Open /schedule/from-backend first, or /schedule/from-backend/start to refresh it."
+            ),
+        )
+
+    with LATEST_SCHEDULE_FILE.open("r", encoding="utf-8") as file:
+        return json.load(file)
+
+
 def _run_scheduler_job(payload: Dict[str, Any], fetch_seconds: float) -> Dict[str, Any]:
     started = time.perf_counter()
     result = run_scheduler(payload)
@@ -100,6 +124,7 @@ def _run_scheduler_job(payload: Dict[str, Any], fetch_seconds: float) -> Dict[st
         "schedule": round(time.perf_counter() - started, 3),
         "total": round(fetch_seconds + time.perf_counter() - started, 3),
     }
+    _save_latest_schedule(result)
     return result
 
 
@@ -124,6 +149,7 @@ def _create_job(payload: Dict[str, Any], fetch_seconds: float) -> Dict[str, Any]
         "rawCounts": _payload_counts(payload),
         "statusUrl": f"/schedule/jobs/{job_id}",
         "resultUrl": f"/schedule/jobs/{job_id}/result",
+        "latestUrl": "/schedule/latest",
     }
 
 
@@ -190,6 +216,7 @@ def generate_schedule(payload: Dict[str, Any]) -> Dict[str, Any]:
         result["metadata"]["apiTimingSeconds"] = {
             "schedule": round(time.perf_counter() - started, 3),
         }
+        _save_latest_schedule(result)
         return result
     except TimeoutError as exc:
         raise HTTPException(status_code=504, detail=str(exc)) from exc
@@ -243,6 +270,11 @@ def get_schedule_job_result(job_id: str) -> Dict[str, Any]:
     return resolved["result"]
 
 
+@app.get("/schedule/latest")
+def get_latest_schedule() -> Dict[str, Any]:
+    return _load_latest_schedule()
+
+
 @app.get("/schedule/from-backend")
 def generate_schedule_from_backend() -> Dict[str, Any]:
     started = time.perf_counter()
@@ -259,6 +291,7 @@ def generate_schedule_from_backend() -> Dict[str, Any]:
             "schedule": round(time.perf_counter() - fetched_at, 3),
             "total": round(time.perf_counter() - started, 3),
         }
+        _save_latest_schedule(result)
         return result
     except TimeoutError as exc:
         raise HTTPException(status_code=504, detail=str(exc)) from exc
