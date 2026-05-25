@@ -2,7 +2,10 @@ import multiprocessing as mp
 import os
 import queue
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from threading import Lock
 from typing import Any, Dict
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 
@@ -15,8 +18,12 @@ BACKEND_AI_DATA_URL = os.getenv(
 )
 BACKEND_FETCH_TIMEOUT_SECONDS = int(os.getenv("BACKEND_FETCH_TIMEOUT_SECONDS", "60"))
 SCHEDULER_TIMEOUT_SECONDS = int(os.getenv("SCHEDULER_TIMEOUT_SECONDS", "240"))
+SCHEDULER_JOB_WORKERS = int(os.getenv("SCHEDULER_JOB_WORKERS", "1"))
 
 app = FastAPI(title="AD Scheduling API")
+job_executor = ThreadPoolExecutor(max_workers=max(1, SCHEDULER_JOB_WORKERS))
+jobs: Dict[str, Dict[str, Any]] = {}
+jobs_lock = Lock()
 
 
 def _run_scheduler_worker(payload: Dict[str, Any], result_queue) -> None:
@@ -84,6 +91,86 @@ def _payload_counts(payload: Dict[str, Any]) -> Dict[str, int]:
     }
 
 
+def _run_scheduler_job(payload: Dict[str, Any], fetch_seconds: float) -> Dict[str, Any]:
+    started = time.perf_counter()
+    result = run_scheduler(payload)
+    result.setdefault("metadata", {})
+    result["metadata"]["apiTimingSeconds"] = {
+        "fetchBackend": round(fetch_seconds, 3),
+        "schedule": round(time.perf_counter() - started, 3),
+        "total": round(fetch_seconds + time.perf_counter() - started, 3),
+    }
+    return result
+
+
+def _create_job(payload: Dict[str, Any], fetch_seconds: float) -> Dict[str, Any]:
+    job_id = uuid4().hex
+    future = job_executor.submit(_run_scheduler_job, payload, fetch_seconds)
+    created_at = time.time()
+    with jobs_lock:
+        jobs[job_id] = {
+            "jobId": job_id,
+            "status": "running",
+            "createdAt": created_at,
+            "fetchSeconds": round(fetch_seconds, 3),
+            "rawCounts": _payload_counts(payload),
+            "future": future,
+        }
+
+    return {
+        "jobId": job_id,
+        "status": "running",
+        "fetchSeconds": round(fetch_seconds, 3),
+        "rawCounts": _payload_counts(payload),
+        "statusUrl": f"/schedule/jobs/{job_id}",
+        "resultUrl": f"/schedule/jobs/{job_id}/result",
+    }
+
+
+def _resolve_job(job_id: str) -> Dict[str, Any]:
+    with jobs_lock:
+        job = jobs.get(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+
+    future: Future = job["future"]
+    elapsed = round(time.time() - job["createdAt"], 3)
+
+    if not future.done():
+        return {
+            "jobId": job_id,
+            "status": "running",
+            "elapsedSeconds": elapsed,
+            "fetchSeconds": job["fetchSeconds"],
+            "rawCounts": job["rawCounts"],
+        }
+
+    try:
+        result = future.result()
+    except Exception as exc:
+        with jobs_lock:
+            job["status"] = "failed"
+            job["error"] = str(exc)
+        return {
+            "jobId": job_id,
+            "status": "failed",
+            "elapsedSeconds": elapsed,
+            "error": str(exc),
+        }
+
+    with jobs_lock:
+        job["status"] = "completed"
+        job["result"] = result
+
+    return {
+        "jobId": job_id,
+        "status": "completed",
+        "elapsedSeconds": elapsed,
+        "result": result,
+    }
+
+
 @app.get("/")
 def root() -> Dict[str, str]:
     return {"message": "AD Scheduling API is running"}
@@ -128,6 +215,32 @@ def debug_backend_payload() -> Dict[str, Any]:
         }
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/schedule/from-backend/start")
+def start_schedule_from_backend_job() -> Dict[str, Any]:
+    started = time.perf_counter()
+    try:
+        payload = load_json_from_url(
+            BACKEND_AI_DATA_URL,
+            timeout=BACKEND_FETCH_TIMEOUT_SECONDS,
+        )
+        return _create_job(payload, time.perf_counter() - started)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/schedule/jobs/{job_id}")
+def get_schedule_job(job_id: str) -> Dict[str, Any]:
+    return _resolve_job(job_id)
+
+
+@app.get("/schedule/jobs/{job_id}/result")
+def get_schedule_job_result(job_id: str) -> Dict[str, Any]:
+    resolved = _resolve_job(job_id)
+    if resolved.get("status") != "completed":
+        raise HTTPException(status_code=202, detail=resolved)
+    return resolved["result"]
 
 
 @app.get("/schedule/from-backend")
