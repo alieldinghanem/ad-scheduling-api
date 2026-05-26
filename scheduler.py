@@ -3108,12 +3108,17 @@ class SchedulingEngine:
         ]
 
     def _simplify_session_output(self, session: dict) -> dict:
+        section_ids = self._session_section_ids(session)
+        is_section = session.get("sessionType") == "SECTION"
+        group_ids = (
+            section_ids
+            if is_section and section_ids
+            else self._session_group_ids(session)
+        )
         simple = {
             "sessionId": session.get("sessionId"),
             "sessionType": session.get("sessionType"),
             "courseCode": session.get("courseCode"),
-            "groupId": session.get("groupId"),
-            "sectionId": session.get("sectionId"),
             "instructorId": session.get("instructorId"),
             "instructorName": session.get("instructorName"),
             "roomId": session.get("roomId"),
@@ -3126,10 +3131,14 @@ class SchedulingEngine:
             "isOnline": session.get("isOnline", False),
         }
 
-        if session.get("groupIds"):
-            simple["groupIds"] = session.get("groupIds")
-        if session.get("sectionIds"):
-            simple["sectionIds"] = session.get("sectionIds")
+        if len(group_ids) <= 1:
+            simple["groupId"] = group_ids[0] if group_ids else session.get("groupId")
+        if not is_section and len(section_ids) <= 1:
+            simple["sectionId"] = session.get("sectionId")
+        if group_ids:
+            simple["groupIds"] = group_ids
+        if section_ids and not is_section:
+            simple["sectionIds"] = section_ids
         if session.get("groupStudentCounts"):
             simple["groupStudentCounts"] = session.get("groupStudentCounts")
 
