@@ -170,6 +170,9 @@ class SchedulingEngine:
         self.warnings: List[str] = []
         self.skipped_courses: Dict[str, str] = {}
         self.blocked_courses: set = set()
+        self.aptech_reserved_slots_by_identity = set()
+        self.aptech_reserved_slots_by_course: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+        self._reserve_aptech_slots()
 
         self._filter_courses_without_required_staff()
 
@@ -319,7 +322,7 @@ class SchedulingEngine:
         base_warnings = list(self.warnings)
         attempts = []
 
-        for strategy in ("balanced", "scarce_first", "large_first", "course_batches"):
+        for strategy in ("balanced",):
             self._restore_state(checkpoint)
             self.unscheduled_reasons = list(base_unscheduled)
             self.warnings = list(base_warnings)
@@ -1957,6 +1960,7 @@ class SchedulingEngine:
         return (
             self._is_instructor_available(instructor, day, slot)
             and not self._has_instructor_time_conflict(instructor_id, day, slot)
+            and not self._is_slot_reserved_for_aptech(instructor, day, slot)
         )
 
     def _can_use_room(self, room: dict, day: str, slot: str) -> bool:
@@ -3110,6 +3114,54 @@ class SchedulingEngine:
 
         return sorted(result, key=self._course_output_sort_key)
 
+    def _reserve_aptech_slots(self) -> None:
+        reserved = set()
+
+        for course in sorted(self.aptech_courses, key=self._aptech_scheduling_sort_key):
+            code = course.get("courseCode")
+            if not code:
+                continue
+
+            identity = self._aptech_course_identity_key(course)
+            for availability in self._aptech_search_availabilities(course.get("availabilities") or []):
+                day = availability.get("dayOfWeek")
+                if not day:
+                    continue
+
+                for slot in self._aptech_slots_for_availability(availability):
+                    key = (identity, day, slot)
+                    if key in reserved:
+                        continue
+
+                    reserved.add(key)
+                    self.aptech_reserved_slots_by_identity.add(key)
+                    self.aptech_reserved_slots_by_course[code].append((day, slot))
+
+    def _instructor_identity_keys(self, instructor: dict) -> List[Tuple[str, object]]:
+        keys = []
+        instructor_id = instructor.get("instructorId")
+        if instructor_id is not None:
+            keys.append(("id", instructor_id))
+
+        for field in ("name", "nameAr"):
+            normalized_name = self._normalized_person_name(instructor.get(field))
+            if normalized_name:
+                keys.append(("name", normalized_name))
+
+        return keys
+
+    def _is_slot_reserved_for_aptech(self, instructor: dict, day: str, slot: str) -> bool:
+        instructor_identities = set(self._instructor_identity_keys(instructor))
+        if not instructor_identities:
+            return False
+
+        return any(
+            reserved_identity in instructor_identities
+            and reserved_day == day
+            and self._slots_overlap(reserved_slot, slot)
+            for reserved_identity, reserved_day, reserved_slot in self.aptech_reserved_slots_by_identity
+        )
+
     def _aptech_course_identity_key(self, course: dict, instructor_id=None, instructor_name=None):
         name = (
             instructor_name
@@ -3133,6 +3185,13 @@ class SchedulingEngine:
                 count += 1
 
         return max(1, count)
+
+    def _aptech_scheduling_sort_key(self, course: dict):
+        return (
+            str(self._aptech_course_identity_key(course)),
+            -self._safe_int(course.get("totalStudentCount"), 0),
+            self._course_output_sort_key(course),
+        )
 
     def _aptech_possible_assignment_count(
         self,
@@ -3251,6 +3310,50 @@ class SchedulingEngine:
         primary_level = levels[0] if levels else None
         seen_slots = set()
 
+        for day, slot in self.aptech_reserved_slots_by_course.get(code, []):
+            key = (identity, day, slot)
+            if key in busy or key in seen_slots:
+                continue
+            if self._has_existing_instructor_time_conflict(
+                instructor_id,
+                instructor_name,
+                day,
+                slot,
+            ):
+                continue
+
+            busy.add(key)
+            seen_slots.add(key)
+            start, end = slot.split("-", 1)
+            self.session_counter += 1
+            assignments.append({
+                "sessionId": f"SESSION_{self.session_counter:06d}",
+                "sessionType": "APTECH",
+                "courseCode": code,
+                "courseName": course_name,
+                "courseNameAr": course_name_ar,
+                "groupId": f"APTECH-{code}-G1",
+                "sectionId": None,
+                "level": primary_level,
+                "levels": levels,
+                "dayOfWeek": day,
+                "startTime": start,
+                "endTime": end,
+                "timeSlot": slot,
+                "instructorId": instructor_id,
+                "instructorName": instructor_name,
+                "instructorType": instructor_type,
+                "roomId": None,
+                "roomNumber": "ONLINE",
+                "roomType": "ONLINE",
+                "roomCapacity": 0,
+                "studentCount": self._safe_int(course.get("totalStudentCount"), 0),
+                "isAptech": True,
+                "isOnline": True,
+            })
+            if max_sessions is not None and len(assignments) >= max_sessions:
+                return self._sort_aptech_sessions(assignments)
+
         for availability in search_availabilities:
             day = availability.get("dayOfWeek")
             if not day:
@@ -3344,7 +3447,8 @@ class SchedulingEngine:
                 if self._slot_within_range(slot, start, end)
             ]
 
-            return matching
+            if matching:
+                return matching
 
         if start and end:
             return [f"{start}-{end}"]
