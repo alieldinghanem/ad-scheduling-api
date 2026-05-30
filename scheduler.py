@@ -4440,6 +4440,8 @@ class SchedulingEngine:
                 level_group_count,
                 max(course_group_counts.values(), default=1),
             )
+            if level == 4:
+                lecture_group_count = level_group_count
             lecture_group_sizes = self._split_evenly(max_students, lecture_group_count)
 
             for group_index, group_size in enumerate(lecture_group_sizes, start=1):
@@ -4499,16 +4501,7 @@ class SchedulingEngine:
         if count >= len(group_ids):
             return list(group_ids)
 
-        ranked = sorted(
-            group_ids,
-            key=lambda group_id: (
-                len(self.group_details.get(group_id, {}).get("courseCodes") or []),
-                (sum(ord(ch) for ch in course_code) + self._group_sort_key(group_id)[1]) % max(1, len(group_ids)),
-                self._group_sort_key(group_id),
-            ),
-        )
-
-        return sorted(ranked[:count], key=self._group_sort_key)
+        return sorted(group_ids, key=self._group_sort_key)[:count]
 
     def _assign_generated_cohorts_to_groups(self) -> None:
         course_segment_groups = defaultdict(list)
