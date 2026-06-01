@@ -258,13 +258,9 @@ class SchedulingEngine:
             "collegeCourses": self._simplify_courses_output(college_courses_output),
             "arabicCourses": self._simplify_courses_output(arabic_courses_output),
 
-            # Keep Aptech raw because it has assignedInstructorId, dayOfWeek, timeSlot, and sessions.
-            "aptechCourses": aptech_courses_output,
-
             "schedulesByType": {
                 "college": self._simplify_courses_output(college_courses_output),
                 "arabic": self._simplify_courses_output(arabic_courses_output),
-                "aptech": aptech_courses_output,
             },
 
             "optimizationSummary": self._build_optimization_summary(),
@@ -285,7 +281,6 @@ class SchedulingEngine:
                 "warnings": self.warnings,
                 "capacityIssues": self._build_capacity_issues_output(),
                 "conflicts": conflicts,
-                "unscheduledAptechCourses": aptech_unscheduled,
                 "skippedCourses": [
                     {"courseCode": code, "reason": reason}
                     for code, reason in sorted(self.skipped_courses.items())
@@ -419,6 +414,10 @@ class SchedulingEngine:
                 "instructors": instructors,
                 "rooms": rooms,
                 "scheduled": 0,
+                "coverageMinimum": min(
+                    len(section_sizes or []),
+                    max(1, self.min_sections_per_lecture_group),
+                ),
                 "blocked": False,
                 "fallbackUsed": False,
             }
@@ -443,30 +442,17 @@ class SchedulingEngine:
                 )
                 state["blocked"] = True
 
-        while True:
-            active = [
-                state
-                for state in states
-                if not state["blocked"]
-                and state["scheduled"] < len(state["sectionSizes"])
-            ]
-            if not active:
-                break
-
-            progress = False
-            active.sort(key=lambda state: self._section_state_priority_key(state, strategy))
-
-            for state in active:
-                if state["blocked"] or state["scheduled"] >= len(state["sectionSizes"]):
-                    continue
-
-                if self._schedule_next_section_for_state(state):
-                    progress = True
-                else:
-                    state["blocked"] = True
-
-            if not progress:
-                break
+        self._schedule_section_state_passes(
+            states,
+            strategy,
+            target_key="coverageMinimum",
+        )
+        self._schedule_section_state_passes(
+            states,
+            strategy,
+            target_key="sectionSizes",
+        )
+        self._repair_zero_section_states(states, strategy)
 
         for state in states:
             demand = state["demand"]
@@ -532,6 +518,7 @@ class SchedulingEngine:
             )
 
         return (
+            0 if state["scheduled"] < state.get("coverageMinimum", 1) else 1,
             state["scheduled"],
             placements,
             -remaining,
@@ -540,6 +527,295 @@ class SchedulingEngine:
             demand.get("courseCode") or "",
             demand.get("groupId") or "",
         )
+
+    def _repair_zero_section_states(self, states: List[dict], strategy: str) -> None:
+        zero_states = [
+            state
+            for state in states
+            if state["scheduled"] <= 0
+            and state.get("sectionSizes")
+            and state.get("instructors")
+            and state.get("rooms")
+        ]
+        zero_states.sort(key=lambda state: self._section_state_priority_key(state, strategy))
+
+        for state in zero_states:
+            if state["scheduled"] > 0:
+                continue
+
+            demand = state["demand"]
+            section_demand = self._build_section_demand(
+                demand,
+                1,
+                state["sectionSizes"][0],
+                demand["labType"],
+            )
+
+            if self._schedule_one_section(
+                section_demand,
+                state["instructors"],
+                state["rooms"],
+            ):
+                state["scheduled"] += 1
+                state["blocked"] = False
+                continue
+
+            if self._schedule_one_section_by_displacing_optional_section(
+                section_demand,
+                state["instructors"],
+                state["rooms"],
+                states,
+            ):
+                state["scheduled"] += 1
+                state["blocked"] = False
+
+    def _schedule_one_section_by_displacing_optional_section(
+        self,
+        demand: dict,
+        instructors: List[dict],
+        rooms: List[dict],
+        states: List[dict],
+    ) -> bool:
+        group_id = demand["groupId"]
+        section_id = demand["sectionId"]
+        slots = self._preferred_slots_for_course(demand["courseCode"], "SECTION")
+        day_order = {day: index for index, day in enumerate(self.days)}
+        slot_order = {slot: index for index, slot in enumerate(slots)}
+        candidates = []
+
+        for day in self._preferred_days_for_group(group_id):
+            for slot in self._preferred_slots_for_group_on_day(group_id, day, slots):
+                if self._has_group_time_conflict(group_id, day, slot, demand):
+                    continue
+
+                if any(
+                    busy_section == section_id
+                    and busy_day == day
+                    and self._slots_overlap(busy_slot, slot)
+                    for busy_section, busy_day, busy_slot in self.section_busy
+                ):
+                    continue
+
+                free_rooms = [
+                    room
+                    for room in self._least_busy_rooms(rooms)
+                    if self._safe_int(room.get("capacity"), 0) >= demand["studentCount"]
+                    and self._can_use_room(room, day, slot)
+                ]
+                if not free_rooms:
+                    continue
+
+                for instructor in self._least_busy_instructors(instructors):
+                    if not self._is_instructor_available(instructor, day, slot):
+                        continue
+
+                    instructor_id = instructor.get("instructorId")
+                    displaced = self._displaceable_instructor_section(
+                        instructor_id,
+                        day,
+                        slot,
+                        states,
+                    )
+                    if not displaced:
+                        continue
+
+                    displaced_count = self._scheduled_section_count_for_course_group(
+                        displaced.get("courseCode"),
+                        displaced.get("groupId"),
+                    )
+                    room = free_rooms[0]
+                    candidates.append((
+                        (
+                            -displaced_count,
+                            len(self.instructor_schedules.get(instructor_id, [])),
+                            len(self.room_schedules.get(room.get("roomId"), [])),
+                            day_order.get(day, 999),
+                            slot_order.get(slot, 999),
+                            instructor_id or 0,
+                            room.get("roomId") or 0,
+                        ),
+                        instructor,
+                        room,
+                        day,
+                        slot,
+                        displaced,
+                    ))
+
+        if not candidates:
+            return False
+
+        _, instructor, room, day, slot, displaced = min(candidates, key=lambda item: item[0])
+        self._remove_scheduled_session(displaced)
+        displaced_state = self._state_for_session(states, displaced)
+        if displaced_state and displaced_state["scheduled"] > 0:
+            displaced_state["scheduled"] -= 1
+            displaced_state["blocked"] = False
+
+        session = self._create_scheduled_session(demand, instructor, room, day, slot)
+        self._place_session(group_id, session)
+        return True
+
+    def _displaceable_instructor_section(
+        self,
+        instructor_id: Optional[int],
+        day: str,
+        slot: str,
+        states: List[dict],
+    ) -> Optional[dict]:
+        if instructor_id is None:
+            return None
+
+        candidates = []
+        for session in self.instructor_schedules.get(instructor_id, []):
+            if session.get("sessionType") != "SECTION":
+                continue
+            if session.get("dayOfWeek") != day:
+                continue
+            if not self._slots_overlap(session.get("timeSlot"), slot):
+                continue
+            if not self._can_displace_section_session(session, states):
+                continue
+
+            candidates.append(session)
+
+        if not candidates:
+            return None
+
+        return max(
+            candidates,
+            key=lambda session: (
+                self._scheduled_section_count_for_course_group(
+                    session.get("courseCode"),
+                    session.get("groupId"),
+                ),
+                self._safe_int(session.get("studentCount"), 0),
+            ),
+        )
+
+    def _can_displace_section_session(self, session: dict, states: List[dict]) -> bool:
+        if session.get("sessionType") != "SECTION":
+            return False
+
+        count = self._scheduled_section_count_for_course_group(
+            session.get("courseCode"),
+            session.get("groupId"),
+        )
+        if count <= 1:
+            return False
+
+        state = self._state_for_session(states, session)
+        if state and state["scheduled"] <= state.get("coverageMinimum", 1):
+            return False
+
+        return True
+
+    def _scheduled_section_count_for_course_group(
+        self,
+        course_code: Optional[str],
+        group_id: Optional[str],
+    ) -> int:
+        if not course_code or not group_id:
+            return 0
+
+        return sum(
+            1
+            for session in self.group_schedules.get(group_id, [])
+            if session.get("courseCode") == course_code
+            and session.get("sessionType") == "SECTION"
+        )
+
+    def _state_for_session(self, states: List[dict], session: dict) -> Optional[dict]:
+        course_code = session.get("courseCode")
+        group_id = session.get("groupId")
+
+        for state in states:
+            demand = state.get("demand", {})
+            if demand.get("courseCode") == course_code and demand.get("groupId") == group_id:
+                return state
+
+        return None
+
+    def _remove_scheduled_session(self, session: dict) -> None:
+        session_id = session.get("sessionId")
+        group_id = session.get("groupId")
+        instructor_id = session.get("instructorId")
+        room_id = session.get("roomId")
+        day = session.get("dayOfWeek")
+        slot = session.get("timeSlot")
+        section_id = session.get("sectionId")
+
+        def keep(item: dict) -> bool:
+            return item.get("sessionId") != session_id
+
+        if group_id in self.group_schedules:
+            self.group_schedules[group_id] = [
+                item for item in self.group_schedules[group_id] if keep(item)
+            ]
+
+        if instructor_id in self.instructor_schedules:
+            self.instructor_schedules[instructor_id] = [
+                item for item in self.instructor_schedules[instructor_id] if keep(item)
+            ]
+
+        if room_id in self.room_schedules:
+            self.room_schedules[room_id] = [
+                item for item in self.room_schedules[room_id] if keep(item)
+            ]
+
+        if group_id and day and slot:
+            self.group_busy.discard((group_id, day, slot))
+        if section_id and day and slot:
+            self.section_busy.discard((section_id, day, slot))
+        for cohort_id in self._cohort_ids_for_session(session):
+            if day and slot:
+                self.cohort_busy.discard((cohort_id, day, slot))
+        if instructor_id is not None and day and slot:
+            self.instructor_busy.discard((instructor_id, day, slot))
+        if room_id is not None and day and slot:
+            self.room_busy.discard((room_id, day, slot))
+
+    def _schedule_section_state_passes(
+        self,
+        states: List[dict],
+        strategy: str,
+        target_key: str,
+    ) -> None:
+        while True:
+            active = []
+            for state in states:
+                if state["blocked"]:
+                    continue
+
+                target = (
+                    len(state["sectionSizes"])
+                    if target_key == "sectionSizes"
+                    else state.get(target_key, 0)
+                )
+                if state["scheduled"] < target:
+                    active.append(state)
+
+            if not active:
+                break
+
+            progress = False
+            active.sort(key=lambda state: self._section_state_priority_key(state, strategy))
+
+            for state in active:
+                target = (
+                    len(state["sectionSizes"])
+                    if target_key == "sectionSizes"
+                    else state.get(target_key, 0)
+                )
+                if state["blocked"] or state["scheduled"] >= target:
+                    continue
+
+                if self._schedule_next_section_for_state(state):
+                    progress = True
+                else:
+                    state["blocked"] = True
+
+            if not progress:
+                break
 
     def _schedule_next_section_for_state(self, state: dict) -> bool:
         demand = state["demand"]
@@ -1284,6 +1560,49 @@ class SchedulingEngine:
         return True
 
     def _schedule_one_section(
+        self,
+        demand: dict,
+        instructors: List[dict],
+        rooms: List[dict],
+    ) -> bool:
+        for section_id in self._section_id_candidates_for_demand(demand):
+            candidate_demand = dict(demand)
+            candidate_demand["sectionId"] = section_id
+            if self._schedule_one_section_exact(candidate_demand, instructors, rooms):
+                return True
+
+        return False
+
+    def _section_id_candidates_for_demand(self, demand: dict) -> List[str]:
+        preferred = demand.get("sectionId")
+        group_id = demand.get("groupId")
+        course_code = demand.get("courseCode")
+        details = self.group_details.get(group_id, {})
+        known_section_ids = list(details.get("sectionIds") or details.get("cohortIds") or [])
+
+        candidates = []
+        if preferred:
+            candidates.append(preferred)
+
+        candidates.extend(section_id for section_id in known_section_ids if section_id not in candidates)
+
+        if not candidates and preferred:
+            candidates.append(preferred)
+
+        used_for_course = {
+            session.get("sectionId")
+            for session in self.group_schedules.get(group_id, [])
+            if session.get("courseCode") == course_code
+            and session.get("sessionType") == "SECTION"
+        }
+
+        return [
+            section_id
+            for section_id in candidates
+            if section_id and section_id not in used_for_course
+        ]
+
+    def _schedule_one_section_exact(
         self,
         demand: dict,
         instructors: List[dict],
@@ -5628,12 +5947,10 @@ class SchedulingEngine:
 
             "collegeCourses": [],
             "arabicCourses": [],
-            "aptechCourses": aptech_output,
 
             "schedulesByType": {
                 "college": [],
                 "arabic": [],
-                "aptech": aptech_output,
             },
 
             "optimizationSummary": {
@@ -5658,9 +5975,6 @@ class SchedulingEngine:
                 "warnings": getattr(self, "warnings", []),
                 "capacityIssues": [],
                 "conflicts": [],
-                "unscheduledAptechCourses": [
-                    course for course in aptech_output if course.get("status") != "SCHEDULED"
-                ],
                 "skippedCourses": [
                     {"courseCode": code, "reason": reason}
                     for code, reason in sorted(getattr(self, "skipped_courses", {}).items())
