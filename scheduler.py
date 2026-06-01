@@ -137,7 +137,8 @@ class SchedulingEngine:
         )
 
         self.courses = self._normalize_courses()
-        self.aptech_courses = self._normalize_aptech_courses()
+        # Aptech is handled by the .NET backend now, so the AI scheduler ignores it completely.
+        self.aptech_courses = []
         raw_instructors = []
         raw_instructors.extend(self._instructors_with_source(self.input_data.get("instructors"), "all"))
         raw_instructors.extend(
@@ -147,9 +148,7 @@ class SchedulingEngine:
             self._instructors_with_source(self.input_data.get("arabicInstructors"), "arabic")
         )
         self.instructors = self._normalize_instructors(raw_instructors)
-        self.aptech_instructors = self._normalize_instructors(
-            self.input_data.get("aptechInstructors", [])
-        )
+        self.aptech_instructors = {}
         self.rooms = self._normalize_rooms(self.input_data.get("rooms", []))
 
         self.group_busy = set()
@@ -172,7 +171,6 @@ class SchedulingEngine:
         self.blocked_courses: set = set()
         self.aptech_reserved_slots_by_identity = set()
         self.aptech_reserved_slots_by_course: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
-        self._reserve_aptech_slots()
 
         self._filter_courses_without_required_staff()
 
@@ -201,11 +199,10 @@ class SchedulingEngine:
         self._schedule_arabic_online_courses()
         self._schedule_project_courses()
 
-        aptech_courses_output = self._build_aptech_courses_output()
+        aptech_courses_output = []
         college_courses_output = self._build_course_sessions_output("college")
         arabic_courses_output = self._build_course_sessions_output("arabic")
         conflicts = self.validate_no_conflicts()
-        conflicts.extend(self.validate_aptech_instructor_conflicts(aptech_courses_output))
         conflicts.extend(self.validate_academic_constraints())
 
         aptech_session_count = sum(
@@ -1960,7 +1957,6 @@ class SchedulingEngine:
         return (
             self._is_instructor_available(instructor, day, slot)
             and not self._has_instructor_time_conflict(instructor_id, day, slot)
-            and not self._is_slot_reserved_for_aptech(instructor, day, slot)
         )
 
     def _can_use_room(self, room: dict, day: str, slot: str) -> bool:
@@ -5621,11 +5617,7 @@ class SchedulingEngine:
         return list(value) if isinstance(value, list) and value else list(default)
 
     def _empty_fail(self, message: str) -> dict:
-        aptech_output = (
-            self._build_aptech_courses_output()
-            if hasattr(self, "aptech_courses")
-            else []
-        )
+        aptech_output = []
 
         return {
             "success": False,
