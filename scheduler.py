@@ -17,6 +17,7 @@ ROOM_CAPACITY_OVERRIDES = {}
 ROOM_TYPE_OVERRIDES = {}
 DEFAULT_LECTURE_DURATION_MINUTES = 120
 DEFAULT_SECTION_DURATION_MINUTES = 120
+DEFAULT_TA_MAX_TEACHING_DAYS = 3
 SPECIAL_LECTURE_DURATIONS = {"CS214": 60, "ETS401": 60}
 SPECIAL_SECTION_DURATIONS = {"CS214": 60}
 DEFAULT_DAYS = ["Saturday", "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday"]
@@ -96,6 +97,16 @@ class SchedulingEngine:
         self.regular_slots = self._list_or_default(
             self.input_data.get("regularTimeSlots"), DEFAULT_REGULAR_SLOTS
         )
+        self.default_ta_max_teaching_days = max(
+            1,
+            self._safe_int(
+                self.input_data.get(
+                    "defaultTaMaxTeachingDays",
+                    self.input_data.get("taMaxTeachingDaysPerWeek"),
+                ),
+                DEFAULT_TA_MAX_TEACHING_DAYS,
+            ),
+        )
         self.online_slots = self._list_or_default(
             self.input_data.get("arabicOnlineTimeSlots")
             or self.input_data.get("onlineTimeSlots"),
@@ -137,18 +148,23 @@ class SchedulingEngine:
         )
 
         self.courses = self._normalize_courses()
-        # Aptech is handled by the .NET backend now, so the AI scheduler ignores it completely.
-        self.aptech_courses = []
+        self.aptech_courses = self._normalize_aptech_courses()
         raw_instructors = []
         raw_instructors.extend(self._instructors_with_source(self.input_data.get("instructors"), "all"))
         raw_instructors.extend(
             self._instructors_with_source(self.input_data.get("regularInstructors"), "college")
         )
         raw_instructors.extend(
+            self._instructors_with_source(self.input_data.get("teachingAssistants"), "college")
+        )
+        raw_instructors.extend(
             self._instructors_with_source(self.input_data.get("arabicInstructors"), "arabic")
         )
         self.instructors = self._normalize_instructors(raw_instructors)
-        self.aptech_instructors = {}
+        self.aptech_instructors = self._normalize_instructors(
+            list(self.input_data.get("aptechInstructors") or [])
+            + list(self.input_data.get("teachingAssistants") or [])
+        )
         self.rooms = self._normalize_rooms(self.input_data.get("rooms", []))
 
         self.group_busy = set()
@@ -199,10 +215,11 @@ class SchedulingEngine:
         self._schedule_arabic_online_courses()
         self._schedule_project_courses()
 
-        aptech_courses_output = []
+        aptech_courses_output = self._build_aptech_courses_output()
         college_courses_output = self._build_course_sessions_output("college")
         arabic_courses_output = self._build_course_sessions_output("arabic")
         conflicts = self.validate_no_conflicts()
+        conflicts.extend(self.validate_aptech_instructor_conflicts(aptech_courses_output))
         conflicts.extend(self.validate_academic_constraints())
 
         aptech_session_count = sum(
@@ -257,10 +274,12 @@ class SchedulingEngine:
             # Keep college and Arabic simplified for frontend readability.
             "collegeCourses": self._simplify_courses_output(college_courses_output),
             "arabicCourses": self._simplify_courses_output(arabic_courses_output),
+            "aptechCourses": aptech_courses_output,
 
             "schedulesByType": {
                 "college": self._simplify_courses_output(college_courses_output),
                 "arabic": self._simplify_courses_output(arabic_courses_output),
+                "aptech": aptech_courses_output,
             },
 
             "optimizationSummary": self._build_optimization_summary(),
@@ -281,6 +300,11 @@ class SchedulingEngine:
                 "warnings": self.warnings,
                 "capacityIssues": self._build_capacity_issues_output(),
                 "conflicts": conflicts,
+                "unscheduledAptechCourses": [
+                    course.get("courseCode")
+                    for course in aptech_unscheduled
+                    if course.get("courseCode")
+                ],
                 "skippedCourses": [
                     {"courseCode": code, "reason": reason}
                     for code, reason in sorted(self.skipped_courses.items())
@@ -1573,6 +1597,151 @@ class SchedulingEngine:
 
         return False
 
+    def _ta_course_distribution_score(
+        self,
+        instructor: dict,
+        course_code: str,
+    ) -> Tuple[int, int, int, int]:
+        instructor_id = instructor.get("instructorId")
+        course_count = self._instructor_section_course_count(instructor_id, course_code)
+        schedulable_courses = self._schedulable_section_courses_for_instructor(instructor)
+        uncovered_other_courses = sum(
+            1
+            for code in schedulable_courses
+            if code != course_code
+            and self._course_desired_section_count(code) > 0
+            and self._instructor_section_course_count(instructor_id, code) <= 0
+        )
+        total_count = len(self.instructor_schedules.get(instructor_id, []))
+        desired_share = self._instructor_course_section_slot_share(instructor, course_code)
+        share_overflow = max(0, course_count - desired_share) if desired_share > 0 else 0
+
+        if course_count <= 0:
+            coverage_priority = 0
+        elif uncovered_other_courses > 0:
+            coverage_priority = 2
+        else:
+            coverage_priority = 1
+
+        return (
+            coverage_priority,
+            share_overflow,
+            course_count,
+            total_count,
+        )
+
+    def _ta_flexible_day_score(
+        self,
+        instructor: dict,
+        day: str,
+        slot: str,
+    ) -> Tuple[int, int, int, int]:
+        if not self._is_flexible_ta(instructor):
+            return (0, 0, 0, 0)
+
+        instructor_id = instructor.get("instructorId")
+        used_days = self._instructor_teaching_days(instructor_id)
+        is_existing_day = day in used_days
+        day_session_count = sum(
+            1
+            for session in self.instructor_schedules.get(instructor_id, [])
+            if session.get("dayOfWeek") == day
+        )
+        adjacent_score = self._instructor_adjacent_slot_score(instructor_id, day, slot)
+
+        return (
+            0 if is_existing_day else 1,
+            len(used_days) + (0 if is_existing_day else 1),
+            adjacent_score,
+            -day_session_count,
+        )
+
+    def _is_flexible_ta(self, instructor: dict) -> bool:
+        if instructor.get("instructorType") != "TA":
+            return False
+
+        mode = str(
+            instructor.get("availabilityMode")
+            or instructor.get("taAvailabilityMode")
+            or instructor.get("availability_mode")
+            or ""
+        ).strip().upper()
+
+        if mode in {"FIXED", "STRICT", "MANUAL"}:
+            return False
+
+        return True
+
+    def _ta_max_teaching_days(self, instructor: dict) -> int:
+        requested = max(
+            1,
+            self._safe_int(
+                instructor.get(
+                    "maxTeachingDaysPerWeek",
+                    instructor.get(
+                        "maxTeachingDays",
+                        instructor.get("teachingDaysPerWeek"),
+                    ),
+                ),
+                self.default_ta_max_teaching_days,
+            ),
+        )
+        return max(1, min(requested, self.default_ta_max_teaching_days))
+
+    def _instructor_teaching_days(self, instructor_id: Optional[int]) -> set:
+        if instructor_id is None:
+            return set()
+
+        return {
+            session.get("dayOfWeek")
+            for session in self.instructor_schedules.get(instructor_id, [])
+            if session.get("dayOfWeek")
+        }
+
+    def _instructor_adjacent_slot_score(
+        self,
+        instructor_id: Optional[int],
+        day: str,
+        slot: str,
+    ) -> int:
+        if instructor_id is None:
+            return 1
+
+        target = self._slot_bounds(slot)
+        if not target:
+            return 1
+
+        start, end = target
+        same_day_slots = [
+            self._slot_bounds(session.get("timeSlot"))
+            for session in self.instructor_schedules.get(instructor_id, [])
+            if session.get("dayOfWeek") == day
+        ]
+        same_day_slots = [bounds for bounds in same_day_slots if bounds]
+
+        if not same_day_slots:
+            return 1
+
+        if any(existing_end == start or existing_start == end for existing_start, existing_end in same_day_slots):
+            return 0
+
+        return 1
+
+    def _instructor_section_course_count(
+        self,
+        instructor_id: Optional[int],
+        course_code: str,
+    ) -> int:
+        if instructor_id is None:
+            return 0
+
+        return sum(
+            1
+            for session in self.instructor_schedules.get(instructor_id, [])
+            if session.get("courseCode") == course_code
+            and session.get("sessionType") == "SECTION"
+        )
+
     def _section_id_candidates_for_demand(self, demand: dict) -> List[str]:
         preferred = demand.get("sectionId")
         group_id = demand.get("groupId")
@@ -1599,7 +1768,9 @@ class SchedulingEngine:
         return [
             section_id
             for section_id in candidates
-            if section_id and section_id not in used_for_course
+            if section_id
+            and section_id not in used_for_course
+            and self._section_id_belongs_to_group(section_id, group_id)
         ]
 
     def _schedule_one_section_exact(
@@ -1610,6 +1781,8 @@ class SchedulingEngine:
     ) -> bool:
         group_id = demand["groupId"]
         section_id = demand["sectionId"]
+        if not self._section_id_belongs_to_group(section_id, group_id):
+            return False
 
         slots = self._preferred_slots_for_course(demand["courseCode"], "SECTION")
         day_order = {day: index for index, day in enumerate(self.days)}
@@ -1648,6 +1821,15 @@ class SchedulingEngine:
                         course_slot_share <= 0
                         or course_section_count >= course_slot_share
                     )
+                    ta_distribution_score = self._ta_course_distribution_score(
+                        instructor,
+                        demand["courseCode"],
+                    )
+                    ta_day_score = self._ta_flexible_day_score(
+                        instructor,
+                        day,
+                        slot,
+                    )
 
                     for room in self._least_busy_rooms(rooms):
                         if self._safe_int(room.get("capacity"), 0) < demand["studentCount"]:
@@ -1665,6 +1847,8 @@ class SchedulingEngine:
                             candidates.append((
                                 (
                                     general_section_room_priority,
+                                    *ta_distribution_score,
+                                    *ta_day_score,
                                     1 if over_preferred_share else 0,
                                     course_section_count,
                                     len(self.instructor_schedules.get(instructor_id, [])),
@@ -2632,6 +2816,9 @@ class SchedulingEngine:
         return count
 
     def _is_instructor_available(self, instructor: dict, day: str, slot: str) -> bool:
+        if self._is_flexible_ta(instructor):
+            return self._is_flexible_ta_available(instructor, day)
+
         availabilities = instructor.get("availabilities", [])
 
         if not availabilities:
@@ -2657,6 +2844,61 @@ class SchedulingEngine:
                 return True
 
         return False
+
+    def _is_flexible_ta_available(self, instructor: dict, day: str) -> bool:
+        normalized_day = self._normalize_week_day(day)
+        if not normalized_day:
+            return False
+
+        if normalized_day == "Friday":
+            return False
+
+        if normalized_day in self._instructor_dayoff_days(instructor):
+            return False
+
+        instructor_id = instructor.get("instructorId")
+        used_days = self._instructor_teaching_days(instructor_id)
+        if normalized_day in used_days:
+            return True
+
+        return len(used_days) < self._ta_max_teaching_days(instructor)
+
+    def _instructor_dayoff_days(self, instructor: dict) -> set:
+        values = []
+        for key in (
+            "dayoffweek",
+            "dayOffWeek",
+            "dayOffWeeks",
+            "dayOffs",
+            "daysOff",
+            "blockedDays",
+            "unavailableDays",
+        ):
+            raw = instructor.get(key)
+            if isinstance(raw, str):
+                values.append(raw)
+            elif isinstance(raw, list):
+                values.extend(raw)
+
+        result = set()
+        for value in values:
+            day = self._normalize_week_day(value)
+            if day:
+                result.add(day)
+
+        return result
+
+    def _normalize_week_day(self, value) -> Optional[str]:
+        text = str(value or "").strip()
+        if not text:
+            return None
+
+        normalized = text.replace("_", "").replace("-", "").replace(" ", "").lower()
+        day_map = {
+            day.replace("_", "").replace("-", "").replace(" ", "").lower(): day
+            for day in list(self.days) + ["Friday"]
+        }
+        return day_map.get(normalized)
 
     def _place_session(
         self,
@@ -2777,6 +3019,17 @@ class SchedulingEngine:
                 section_id = session.get("sectionId")
                 instructor_id = session.get("instructorId")
                 instructor_key = instructor_id
+
+                if (
+                    section_id
+                    and session.get("sessionType") == "SECTION"
+                    and not session.get("isProject")
+                    and not self._section_id_belongs_to_group(section_id, group_key)
+                ):
+                    conflicts.append(
+                        "Section/group mismatch: "
+                        f"course={session.get('courseCode')} group={group_key} section={section_id}"
+                    )
 
                 for existing in seen_group_sessions[group_key]:
                     if (
@@ -3322,7 +3575,11 @@ class SchedulingEngine:
             is_aptech_computer = self._is_aptech_computer_course(course)
             matching = []
             seen_instructor_ids = set()
-            instructor_pool = list(self.aptech_instructors.values())
+            instructor_pool = list(self.aptech_instructors.values()) or [
+                instructor
+                for instructor in self.instructors.values()
+                if instructor.get("instructorType") == "TA"
+            ]
 
             for instructor in instructor_pool:
                 instructor_id = instructor.get("instructorId")
@@ -3387,6 +3644,9 @@ class SchedulingEngine:
             elif assigned and assigned.get("availabilities"):
                 availabilities = assigned["availabilities"]
 
+            if is_aptech_computer and assigned:
+                availabilities = self._aptech_computer_availabilities_for_ta(assigned)
+
             identity_key = self._aptech_course_identity_key(course, instructor_id, instructor_name)
             share_count = self._aptech_identity_course_count(identity_key)
             possible_count = self._aptech_possible_assignment_count(
@@ -3428,6 +3688,56 @@ class SchedulingEngine:
             })
 
         return sorted(result, key=self._course_output_sort_key)
+
+    def _aptech_computer_availabilities_for_ta(self, instructor: dict) -> List[dict]:
+        instructor_id = instructor.get("instructorId")
+        used_college_days = self._instructor_teaching_days(instructor_id)
+        blocked_days = self._instructor_dayoff_days(instructor)
+        slots = self.input_data.get("aptechTimeSlots") or self.regular_slots
+
+        candidates = []
+        for day in self.days:
+            normalized_day = self._normalize_week_day(day)
+            if not normalized_day or normalized_day == "Friday":
+                continue
+            if normalized_day in blocked_days:
+                continue
+            if normalized_day in used_college_days:
+                continue
+
+            free_slots = []
+            for slot in slots:
+                if "-" not in str(slot):
+                    continue
+                if self._has_instructor_time_conflict(instructor_id, normalized_day, slot):
+                    continue
+                free_slots.append(slot)
+
+            if not free_slots:
+                continue
+
+            candidates.append((
+                (
+                    -len(free_slots),
+                    self.days.index(day) if day in self.days else 999,
+                    normalized_day,
+                ),
+                normalized_day,
+                free_slots,
+            ))
+
+        if not candidates:
+            return []
+
+        _, selected_day, selected_slots = min(candidates, key=lambda item: item[0])
+        return [
+            {
+                "dayOfWeek": selected_day,
+                "startTime": slot.split("-", 1)[0],
+                "endTime": slot.split("-", 1)[1],
+            }
+            for slot in selected_slots
+        ]
 
     def _reserve_aptech_slots(self) -> None:
         reserved = set()
@@ -5563,7 +5873,10 @@ class SchedulingEngine:
             return []
 
         if candidate and candidate.get("sectionId"):
-            return [candidate["sectionId"]]
+            section_id = candidate["sectionId"]
+            if self._section_id_belongs_to_group(section_id, group_id):
+                return [section_id]
+            return [group_id]
 
         details = self.group_details.get(group_id, {})
         return list(details.get("sectionIds") or details.get("cohortIds") or [group_id])
@@ -5692,6 +6005,32 @@ class SchedulingEngine:
             value //= 26
 
         return f"{group_id}{''.join(reversed(letters))}"
+
+    def _section_group_from_section_id(self, section_id: Optional[str]) -> Optional[str]:
+        value = str(section_id or "").strip()
+        if not value:
+            return None
+
+        split_index = len(value)
+        while split_index > 0 and value[split_index - 1].isalpha():
+            split_index -= 1
+
+        group_id = value[:split_index]
+        suffix = value[split_index:]
+        if not group_id or not suffix:
+            return None
+
+        return group_id
+
+    def _section_id_belongs_to_group(
+        self,
+        section_id: Optional[str],
+        group_id: Optional[str],
+    ) -> bool:
+        if not section_id or not group_id:
+            return False
+
+        return self._section_group_from_section_id(section_id) == str(group_id)
 
     def _sort_sessions(self, sessions: List[dict]) -> List[dict]:
         day_order = {
