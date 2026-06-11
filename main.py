@@ -195,14 +195,32 @@ def normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(raw, dict)
     ]
 
-    regular_instructors = [
-        normalize_instructor(raw)
-        for raw in (
-            list(container.get("instructors", []))
-            + list(container.get("regularInstructors", []))
-        )
-        if isinstance(raw, dict)
-    ]
+    regular_instructors_by_id = {}
+    for raw in (
+        list(container.get("instructors", []))
+        + list(container.get("regularInstructors", []))
+        + list(container.get("teachingAssistants", []))
+    ):
+        if not isinstance(raw, dict):
+            continue
+
+        normalized = normalize_instructor(raw)
+        instructor_id = normalized["instructorId"]
+        existing = regular_instructors_by_id.get(instructor_id)
+
+        if not existing:
+            regular_instructors_by_id[instructor_id] = normalized
+            continue
+
+        if normalized.get("instructorType") == "TA":
+            regular_instructors_by_id[instructor_id] = {
+                **existing,
+                **normalized,
+                "assignedCourses": normalized.get("assignedCourses") or existing.get("assignedCourses", []),
+                "availabilities": normalized.get("availabilities") or existing.get("availabilities", []),
+            }
+
+    regular_instructors = list(regular_instructors_by_id.values())
 
     arabic_instructors = [
         normalize_instructor(raw)
@@ -261,8 +279,17 @@ def normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "regularCourses": courses,
         "instructors": [],
         "regularInstructors": regular_instructors,
+        "teachingAssistants": [
+            normalize_instructor(raw)
+            for raw in container.get("teachingAssistants", [])
+            if isinstance(raw, dict)
+        ],
         "arabicInstructors": arabic_instructors,
-        "aptechInstructors": aptech_instructors,
+        "aptechInstructors": aptech_instructors or [
+            instructor
+            for instructor in regular_instructors
+            if instructor.get("instructorType") == "TA"
+        ],
         "studentGroups": container.get("studentGroups") if isinstance(container.get("studentGroups"), list) else [],
         "rooms": rooms,
         "scheduleUrl": container.get("scheduleUrl"),
