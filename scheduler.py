@@ -176,6 +176,8 @@ class SchedulingEngine:
         self.group_schedules: Dict[str, List[dict]] = defaultdict(list)
         self.instructor_schedules: Dict[int, List[dict]] = defaultdict(list)
         self.room_schedules: Dict[int, List[dict]] = defaultdict(list)
+        self._placement_generation = 0
+        self._placement_count_cache: Dict[Tuple[int, str, str, str], int] = {}
 
         self.group_sizes: Dict[str, int] = {}
         self.group_details: Dict[str, dict] = {}
@@ -437,6 +439,11 @@ class SchedulingEngine:
                 "sectionSizes": section_sizes or [],
                 "instructors": instructors,
                 "rooms": rooms,
+                "placementEstimate": self._static_section_placement_estimate(
+                    demand,
+                    instructors,
+                    rooms,
+                ),
                 "scheduled": 0,
                 "coverageMinimum": min(
                     len(section_sizes or []),
@@ -514,7 +521,13 @@ class SchedulingEngine:
     ) -> Tuple[int, int, int, int, int, str, str]:
         demand = state["demand"]
         remaining = len(state["sectionSizes"]) - state["scheduled"]
-        placements = self._demand_candidate_placement_count(demand)
+        placements = state.get("placementEstimate")
+        if placements is None:
+            placements = self._static_section_placement_estimate(
+                demand,
+                state.get("instructors") or [],
+                state.get("rooms") or [],
+            )
         course_total_students = self._course_total_student_count(
             self.courses.get(demand.get("courseCode") or "", {})
         )
@@ -551,6 +564,27 @@ class SchedulingEngine:
             demand.get("courseCode") or "",
             demand.get("groupId") or "",
         )
+
+    def _static_section_placement_estimate(
+        self,
+        demand: dict,
+        instructors: List[dict],
+        rooms: List[dict],
+    ) -> int:
+        if not instructors or not rooms:
+            return 0
+
+        slots = self._preferred_slots_for_course(demand["courseCode"], "SECTION")
+        viable_group_slots = 0
+        for day in self.days:
+            for slot in slots:
+                if not self._has_group_time_conflict(demand["groupId"], day, slot, demand):
+                    viable_group_slots += 1
+
+        if viable_group_slots <= 0:
+            return 0
+
+        return viable_group_slots * len(instructors) * len(rooms)
 
     def _repair_zero_section_states(self, states: List[dict], strategy: str) -> None:
         zero_states = [
@@ -797,6 +831,7 @@ class SchedulingEngine:
             self.instructor_busy.discard((instructor_id, day, slot))
         if room_id is not None and day and slot:
             self.room_busy.discard((room_id, day, slot))
+        self._invalidate_placement_count_cache()
 
     def _schedule_section_state_passes(
         self,
@@ -936,8 +971,15 @@ class SchedulingEngine:
         return count
 
     def _demand_candidate_placement_count(self, demand: dict) -> int:
+        cache_key = self._placement_count_cache_key(demand)
+        cached = self._placement_count_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         if demand.get("kind") == "SECTION_BUNDLE":
-            return self._section_bundle_candidate_placement_count(demand)
+            count = self._section_bundle_candidate_placement_count(demand)
+            self._placement_count_cache[cache_key] = count
+            return count
 
         course_code = demand["courseCode"]
         group_id = demand["groupId"]
@@ -951,9 +993,11 @@ class SchedulingEngine:
             )
 
         if not instructors and not demand.get("isArabicOnline"):
+            self._placement_count_cache[cache_key] = 0
             return 0
 
         if not is_online and not rooms:
+            self._placement_count_cache[cache_key] = 0
             return 0
 
         slots = (
@@ -983,7 +1027,20 @@ class SchedulingEngine:
                 free_rooms = sum(1 for room in rooms if self._can_use_room(room, day, slot))
                 count += min(free_instructors, free_rooms)
 
+        self._placement_count_cache[cache_key] = count
         return count
+
+    def _placement_count_cache_key(self, demand: dict) -> Tuple[int, str, str, str]:
+        return (
+            self._placement_generation,
+            str(demand.get("kind") or ""),
+            str(demand.get("courseCode") or ""),
+            str(demand.get("groupId") or ""),
+        )
+
+    def _invalidate_placement_count_cache(self) -> None:
+        self._placement_generation += 1
+        self._placement_count_cache.clear()
 
     def _section_bundle_candidate_placement_count(self, demand: dict) -> int:
         course_code = demand["courseCode"]
@@ -2906,6 +2963,7 @@ class SchedulingEngine:
         session: dict,
         reserve_resources: bool = True,
     ) -> None:
+        self._invalidate_placement_count_cache()
         self.group_schedules[group_id].append(session)
 
         if not reserve_resources:
@@ -2964,6 +3022,7 @@ class SchedulingEngine:
         self.instructor_busy = set(checkpoint["instructor_busy"])
         self.room_busy = set(checkpoint["room_busy"])
         self.session_counter = checkpoint["session_counter"]
+        self._invalidate_placement_count_cache()
 
     def _create_scheduled_session(
         self,
