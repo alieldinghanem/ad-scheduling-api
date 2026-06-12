@@ -153,6 +153,43 @@ def _create_job(payload: Dict[str, Any], fetch_seconds: float) -> Dict[str, Any]
     }
 
 
+def _running_job_summary() -> Dict[str, Any]:
+    with jobs_lock:
+        job_items = list(jobs.items())
+
+    for job_id, job in reversed(job_items):
+        future: Future = job["future"]
+        if future.done():
+            continue
+
+        return {
+            "jobId": job_id,
+            "status": "running",
+            "elapsedSeconds": round(time.time() - job["createdAt"], 3),
+            "fetchSeconds": job["fetchSeconds"],
+            "rawCounts": job["rawCounts"],
+            "statusUrl": f"/schedule/jobs/{job_id}",
+            "resultUrl": f"/schedule/jobs/{job_id}/result",
+            "latestUrl": "/schedule/latest",
+            "message": "A schedule generation job is already running.",
+        }
+
+    return {}
+
+
+def _start_backend_schedule_job() -> Dict[str, Any]:
+    running = _running_job_summary()
+    if running:
+        return running
+
+    started = time.perf_counter()
+    payload = load_json_from_url(
+        BACKEND_AI_DATA_URL,
+        timeout=BACKEND_FETCH_TIMEOUT_SECONDS,
+    )
+    return _create_job(payload, time.perf_counter() - started)
+
+
 def _resolve_job(job_id: str) -> Dict[str, Any]:
     with jobs_lock:
         job = jobs.get(job_id)
@@ -246,13 +283,8 @@ def debug_backend_payload() -> Dict[str, Any]:
 
 @app.get("/schedule/from-backend/start")
 def start_schedule_from_backend_job() -> Dict[str, Any]:
-    started = time.perf_counter()
     try:
-        payload = load_json_from_url(
-            BACKEND_AI_DATA_URL,
-            timeout=BACKEND_FETCH_TIMEOUT_SECONDS,
-        )
-        return _create_job(payload, time.perf_counter() - started)
+        return _start_backend_schedule_job()
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -277,29 +309,26 @@ def get_latest_schedule() -> Dict[str, Any]:
 
 @app.get("/schedule/from-backend")
 def generate_schedule_from_backend(refresh: bool = False) -> Dict[str, Any]:
-    if not refresh:
+    if refresh:
         try:
-            return _load_latest_schedule()
-        except HTTPException:
-            pass
+            result = _start_backend_schedule_job()
+            result["message"] = (
+                result.get("message")
+                or "Schedule refresh started in the background. Use latestUrl after completion."
+            )
+            return result
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    started = time.perf_counter()
     try:
-        payload = load_json_from_url(
-            BACKEND_AI_DATA_URL,
-            timeout=BACKEND_FETCH_TIMEOUT_SECONDS,
-        )
-        fetched_at = time.perf_counter()
-        result = _run_scheduler_with_timeout(payload, SCHEDULER_TIMEOUT_SECONDS)
-        result.setdefault("metadata", {})
-        result["metadata"]["apiTimingSeconds"] = {
-            "fetchBackend": round(fetched_at - started, 3),
-            "schedule": round(time.perf_counter() - fetched_at, 3),
-            "total": round(time.perf_counter() - started, 3),
-        }
-        _save_latest_schedule(result)
-        return result
-    except TimeoutError as exc:
-        raise HTTPException(status_code=504, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return _load_latest_schedule()
+    except HTTPException as latest_error:
+        try:
+            result = _start_backend_schedule_job()
+            result["message"] = (
+                "No saved schedule exists yet. "
+                "Schedule generation started in the background; open latestUrl after completion."
+            )
+            return result
+        except Exception as exc:
+            raise HTTPException(status_code=latest_error.status_code, detail=latest_error.detail) from exc
