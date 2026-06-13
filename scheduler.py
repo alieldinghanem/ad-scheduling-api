@@ -3684,6 +3684,36 @@ class SchedulingEngine:
                 )
             )
 
+            if is_aptech_computer:
+                assignments = self._choose_aptech_computer_assignments(
+                    course,
+                    matching,
+                    busy,
+                )
+                primary_assignment = assignments[0] if assignments else {}
+                target_groups = self._aptech_group_sizes(course)
+                result.append({
+                    "courseCode": code,
+                    "courseName": course.get("courseName", code),
+                    "courseNameAr": course.get("courseNameAr"),
+                    "assignedInstructorId": primary_assignment.get("instructorId"),
+                    "assignedInstructorName": primary_assignment.get("instructorName"),
+                    "assignedInstructorType": primary_assignment.get("instructorType") or "TA",
+                    "levels": self._normalize_levels(course),
+                    "departments": self._normalize_departments(course.get("departments")),
+                    "totalStudentCount": self._safe_int(course.get("totalStudentCount"), 0),
+                    "dayOfWeek": primary_assignment.get("dayOfWeek"),
+                    "timeSlot": primary_assignment.get("timeSlot"),
+                    "sessions": assignments,
+                    "totalSessions": len(assignments),
+                    "status": (
+                        "SCHEDULED"
+                        if assignments and len(assignments) >= len(target_groups)
+                        else ("PARTIAL" if assignments else "UNSCHEDULED")
+                    ),
+                })
+                continue
+
             assigned = matching[0] if matching else None
             instructor_id = (
                 assigned.get("instructorId")
@@ -3797,6 +3827,135 @@ class SchedulingEngine:
             }
             for slot in selected_slots
         ]
+
+    def _aptech_group_sizes(self, course: dict) -> List[int]:
+        total = self._safe_int(course.get("totalStudentCount"), 0)
+        max_group_size = max(
+            1,
+            self._safe_int(
+                self.input_data.get("aptechGroupSize")
+                or self.input_data.get("targetGroupSize"),
+                self.target_group_size or 150,
+            ),
+        )
+
+        if total <= 0:
+            return [0]
+
+        group_count = max(1, math.ceil(total / max_group_size))
+        return self._distribute_group_to_sections(total, group_count, max_group_size) or [total]
+
+    def _choose_aptech_computer_assignments(
+        self,
+        course: dict,
+        instructors: List[dict],
+        busy: set,
+    ) -> List[dict]:
+        code = course.get("courseCode")
+        course_name = course.get("courseName", code)
+        course_name_ar = course.get("courseNameAr")
+        levels = self._normalize_levels(course)
+        primary_level = levels[0] if levels else None
+        group_sizes = self._aptech_group_sizes(course)
+        slots_order = {
+            slot: index
+            for index, slot in enumerate(self.input_data.get("aptechTimeSlots") or self.regular_slots)
+        }
+        day_order = {day: index for index, day in enumerate(self.days)}
+        candidates = []
+
+        for instructor in instructors:
+            if instructor.get("instructorType") != "TA":
+                continue
+
+            instructor_id = instructor.get("instructorId")
+            instructor_name = instructor.get("name")
+            identity = self._aptech_course_identity_key(
+                course,
+                instructor_id,
+                instructor_name,
+            )
+
+            for availability in self._aptech_computer_availabilities_for_ta(instructor):
+                day = availability.get("dayOfWeek")
+                if not day:
+                    continue
+
+                for slot in self._aptech_slots_for_availability(availability):
+                    key = (identity, day, slot)
+                    if key in busy:
+                        continue
+                    if self._has_existing_instructor_time_conflict(
+                        instructor_id,
+                        instructor_name,
+                        day,
+                        slot,
+                    ):
+                        continue
+
+                    candidates.append((
+                        (
+                            day_order.get(day, 999),
+                            slots_order.get(slot, 999),
+                            len(self.instructor_schedules.get(instructor_id, [])),
+                            instructor_id or 0,
+                        ),
+                        instructor,
+                        identity,
+                        day,
+                        slot,
+                    ))
+
+        candidates.sort(key=lambda item: item[0])
+        assignments = []
+        used_keys = set()
+
+        for group_index, group_size in enumerate(group_sizes, start=1):
+            selected = None
+            for candidate in candidates:
+                _, instructor, identity, day, slot = candidate
+                key = (identity, day, slot)
+                if key in busy or key in used_keys:
+                    continue
+                selected = candidate
+                break
+
+            if not selected:
+                break
+
+            _, instructor, identity, day, slot = selected
+            key = (identity, day, slot)
+            busy.add(key)
+            used_keys.add(key)
+            start, end = slot.split("-", 1)
+            self.session_counter += 1
+            assignments.append({
+                "sessionId": f"SESSION_{self.session_counter:06d}",
+                "sessionType": "APTECH",
+                "courseCode": code,
+                "courseName": course_name,
+                "courseNameAr": course_name_ar,
+                "groupId": f"APTECH-{code}-G{group_index}",
+                "sectionId": None,
+                "level": primary_level,
+                "levels": levels,
+                "dayOfWeek": day,
+                "startTime": start,
+                "endTime": end,
+                "timeSlot": slot,
+                "instructorId": instructor.get("instructorId"),
+                "instructorName": instructor.get("name"),
+                "instructorType": instructor.get("instructorType") or "TA",
+                "roomId": None,
+                "roomNumber": "ONLINE",
+                "roomType": "ONLINE",
+                "roomCapacity": 0,
+                "studentCount": group_size,
+                "isAptech": True,
+                "isOnline": True,
+            })
+
+        return self._sort_aptech_sessions(assignments)
 
     def _reserve_aptech_slots(self) -> None:
         reserved = set()
