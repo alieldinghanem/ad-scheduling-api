@@ -8,6 +8,7 @@ ONLINE_RECORDED_COURSES = set()
 IGNORED_ONLINE_COURSES = set()
 DISPLAY_ONLY_COURSES = set()
 PROJECT_COURSES = set()
+SECTIONLESS_COURSES = {"CS402"}
 PROJECT_DEFAULT_LEVEL = 4
 PROJECT_DISPLAY_DETAILS = {}
 PHYSICS_LAB_ROOM_IDS = {79, 80}
@@ -55,6 +56,10 @@ class SchedulingEngine:
         )
         self.project_courses.update(
             self._codes_from_course_items(self.input_data.get("projectCourses"))
+        )
+        self.sectionless_courses = self._code_set_setting(
+            ("sectionlessCourses", "selfStudyCourses", "coursesWithoutSections"),
+            SECTIONLESS_COURSES,
         )
         self.project_default_level = max(
             1,
@@ -1364,7 +1369,13 @@ class SchedulingEngine:
 
             group_ids = self._target_group_ids_for_course(code, course)
 
-            if not is_online and course.get("labType") is not None and group_ids:
+            requires_sections = (
+                not is_online
+                and code not in self.sectionless_courses
+                and course.get("labType") is not None
+            )
+
+            if requires_sections and group_ids:
                 available_sections = self._available_section_placements_count(code, course)
                 if available_sections <= 0:
                     self.warnings.append(
@@ -1393,7 +1404,7 @@ class SchedulingEngine:
                 else:
                     lectures.append(lecture_demand)
 
-                if not is_online and course.get("labType") is not None:
+                if requires_sections:
                     lab_type = self._normalized_lab_type(course.get("labType"))
                     section_count = self._target_sections_count(group_size)
 
@@ -3390,6 +3401,7 @@ class SchedulingEngine:
                 "sectionDurationMinutes": (
                     self._course_section_duration(course)
                     if course.get("labType") is not None
+                    and code not in self.sectionless_courses
                     else None
                 ),
                 "sessions": self._sort_sessions(sessions),
@@ -3429,7 +3441,7 @@ class SchedulingEngine:
         if expected_lectures and not expected_lectures.issubset(scheduled_lectures):
             return "PARTIAL"
 
-        if course.get("labType") is not None:
+        if course.get("labType") is not None and course_code not in self.sectionless_courses:
             sections_by_group = defaultdict(int)
             section_counts_by_group = defaultdict(int)
             for session in sessions:
@@ -3711,6 +3723,30 @@ class SchedulingEngine:
                         if assignments and len(assignments) >= len(target_groups)
                         else ("PARTIAL" if assignments else "UNSCHEDULED")
                     ),
+                })
+                continue
+
+            if isinstance(course.get("instructors"), list) and course["instructors"]:
+                assignments = self._choose_aptech_course_instructor_assignments(
+                    course,
+                    busy,
+                )
+                primary_assignment = assignments[0] if assignments else {}
+                result.append({
+                    "courseCode": code,
+                    "courseName": course.get("courseName", code),
+                    "courseNameAr": course.get("courseNameAr"),
+                    "assignedInstructorId": primary_assignment.get("instructorId"),
+                    "assignedInstructorName": primary_assignment.get("instructorName"),
+                    "assignedInstructorType": primary_assignment.get("instructorType") or "APTECH",
+                    "levels": self._normalize_levels(course),
+                    "departments": self._normalize_departments(course.get("departments")),
+                    "totalStudentCount": self._safe_int(course.get("totalStudentCount"), 0),
+                    "dayOfWeek": primary_assignment.get("dayOfWeek"),
+                    "timeSlot": primary_assignment.get("timeSlot"),
+                    "sessions": assignments,
+                    "totalSessions": len(assignments),
+                    "status": "SCHEDULED" if assignments else "UNSCHEDULED",
                 })
                 continue
 
@@ -4247,6 +4283,136 @@ class SchedulingEngine:
                     return self._sort_aptech_sessions(assignments)
 
         return self._sort_aptech_sessions(assignments)
+
+    def _choose_aptech_course_instructor_assignments(
+        self,
+        course: dict,
+        busy: set,
+    ) -> List[dict]:
+        assignments = []
+        code = course.get("courseCode")
+        course_name = course.get("courseName", code)
+        course_name_ar = course.get("courseNameAr")
+        levels = self._normalize_levels(course)
+        primary_level = levels[0] if levels else None
+        total_students = self._safe_int(course.get("totalStudentCount"), 0)
+        seen_slots = set()
+
+        for instructor in course.get("instructors") or []:
+            if not isinstance(instructor, dict):
+                continue
+
+            instructor_id = instructor.get("instructorId")
+            if instructor_id is not None:
+                instructor_id = self._safe_int(instructor_id, instructor_id)
+
+            instructor_name = (
+                instructor.get("instructorName")
+                or instructor.get("name")
+                or instructor.get("instructorNameAr")
+            )
+            instructor_type = instructor.get("instructorType") or "APTECH"
+            identity = self._aptech_course_identity_key(course, instructor_id, instructor_name)
+            availabilities = instructor.get("availabilities") or []
+            possible_count = self._aptech_possible_assignment_count(
+                instructor_id,
+                instructor_name,
+                availabilities,
+            )
+            share_count = self._aptech_nested_instructor_course_count(
+                instructor_id,
+                instructor_name,
+            )
+            max_sessions_for_instructor = (
+                math.ceil(possible_count / share_count)
+                if possible_count > 0
+                else None
+            )
+            used_for_instructor = 0
+
+            for availability in self._aptech_search_availabilities(availabilities):
+                day = availability.get("dayOfWeek")
+                if not day:
+                    continue
+
+                for slot in self._aptech_slots_for_availability(availability):
+                    if (
+                        max_sessions_for_instructor is not None
+                        and used_for_instructor >= max_sessions_for_instructor
+                    ):
+                        break
+
+                    key = (identity, day, slot)
+                    if key in busy or key in seen_slots:
+                        continue
+                    if self._has_existing_instructor_time_conflict(
+                        instructor_id,
+                        instructor_name,
+                        day,
+                        slot,
+                    ):
+                        continue
+
+                    busy.add(key)
+                    seen_slots.add(key)
+                    used_for_instructor += 1
+                    start, end = slot.split("-", 1)
+                    self.session_counter += 1
+                    assignments.append({
+                        "sessionId": f"SESSION_{self.session_counter:06d}",
+                        "sessionType": "APTECH",
+                        "courseCode": code,
+                        "courseName": course_name,
+                        "courseNameAr": course_name_ar,
+                        "groupId": f"APTECH-{code}-G{len(assignments) + 1}",
+                        "sectionId": None,
+                        "level": primary_level,
+                        "levels": levels,
+                        "dayOfWeek": day,
+                        "startTime": start,
+                        "endTime": end,
+                        "timeSlot": slot,
+                        "instructorId": instructor_id,
+                        "instructorName": instructor_name,
+                        "instructorType": instructor_type,
+                        "roomId": None,
+                        "roomNumber": "ONLINE",
+                        "roomType": "ONLINE",
+                        "roomCapacity": 0,
+                        "studentCount": 0,
+                        "isAptech": True,
+                        "isOnline": True,
+                    })
+
+        student_counts = self._split_evenly(total_students, len(assignments))
+        for session, student_count in zip(assignments, student_counts):
+            session["studentCount"] = student_count
+
+        return self._sort_aptech_sessions(assignments)
+
+    def _aptech_nested_instructor_course_count(self, instructor_id, instructor_name) -> int:
+        identity = self._aptech_course_identity_key({}, instructor_id, instructor_name)
+        count = 0
+
+        for course in self.aptech_courses:
+            for instructor in course.get("instructors") or []:
+                if not isinstance(instructor, dict):
+                    continue
+
+                nested_id = instructor.get("instructorId")
+                if nested_id is not None:
+                    nested_id = self._safe_int(nested_id, nested_id)
+                nested_name = (
+                    instructor.get("instructorName")
+                    or instructor.get("name")
+                    or instructor.get("instructorNameAr")
+                )
+
+                if self._aptech_course_identity_key({}, nested_id, nested_name) == identity:
+                    count += 1
+                    break
+
+        return max(1, count)
 
     def _has_existing_instructor_time_conflict(
         self,
