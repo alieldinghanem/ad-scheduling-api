@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 
-from main import load_json_from_url, normalize_payload, run_scheduler
+from main import load_json_from_url, run_scheduler
 
 
 BACKEND_AI_DATA_URL = os.getenv(
@@ -107,7 +107,7 @@ def _load_latest_schedule() -> Dict[str, Any]:
             status_code=404,
             detail=(
                 "No schedule has been generated yet. "
-                "Open /schedule/from-backend first, or /schedule/from-backend/start to refresh it."
+                "Open /schedule/from-backend?refresh=true once, then use /schedule/from-backend."
             ),
         )
 
@@ -147,9 +147,10 @@ def _create_job(payload: Dict[str, Any], fetch_seconds: float) -> Dict[str, Any]
         "status": "running",
         "fetchSeconds": round(fetch_seconds, 3),
         "rawCounts": _payload_counts(payload),
-        "statusUrl": f"/schedule/jobs/{job_id}",
-        "resultUrl": f"/schedule/jobs/{job_id}/result",
-        "latestUrl": "/schedule/latest",
+        "message": (
+            "Schedule generation started in the background. "
+            "Open /schedule/from-backend after a few minutes to get the generated schedule."
+        ),
     }
 
 
@@ -168,10 +169,10 @@ def _running_job_summary() -> Dict[str, Any]:
             "elapsedSeconds": round(time.time() - job["createdAt"], 3),
             "fetchSeconds": job["fetchSeconds"],
             "rawCounts": job["rawCounts"],
-            "statusUrl": f"/schedule/jobs/{job_id}",
-            "resultUrl": f"/schedule/jobs/{job_id}/result",
-            "latestUrl": "/schedule/latest",
-            "message": "A schedule generation job is already running.",
+            "message": (
+                "A schedule generation job is already running. "
+                "Open /schedule/from-backend after it finishes."
+            ),
         }
 
     return {}
@@ -261,74 +262,15 @@ def generate_schedule(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/schedule/from-backend/debug")
-def debug_backend_payload() -> Dict[str, Any]:
-    started = time.perf_counter()
-    try:
-        payload = load_json_from_url(
-            BACKEND_AI_DATA_URL,
-            timeout=BACKEND_FETCH_TIMEOUT_SECONDS,
-        )
-        normalized = normalize_payload(payload)
-        return {
-            "status": "ok",
-            "backendUrl": BACKEND_AI_DATA_URL,
-            "fetchSeconds": round(time.perf_counter() - started, 3),
-            "rawCounts": _payload_counts(payload),
-            "normalizedCounts": _payload_counts(normalized),
-        }
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-
-@app.get("/schedule/from-backend/start")
-def start_schedule_from_backend_job() -> Dict[str, Any]:
-    try:
-        return _start_backend_schedule_job()
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-
-@app.get("/schedule/jobs/{job_id}")
-def get_schedule_job(job_id: str) -> Dict[str, Any]:
-    return _resolve_job(job_id)
-
-
-@app.get("/schedule/jobs/{job_id}/result")
-def get_schedule_job_result(job_id: str) -> Dict[str, Any]:
-    resolved = _resolve_job(job_id)
-    if resolved.get("status") != "completed":
-        raise HTTPException(status_code=202, detail=resolved)
-    return resolved["result"]
-
-
-@app.get("/schedule/latest")
-def get_latest_schedule() -> Dict[str, Any]:
-    return _load_latest_schedule()
-
-
 @app.get("/schedule/from-backend")
 def generate_schedule_from_backend(refresh: bool = False) -> Dict[str, Any]:
     if refresh:
         try:
-            result = _start_backend_schedule_job()
-            result["message"] = (
-                result.get("message")
-                or "Schedule refresh started in the background. Use latestUrl after completion."
-            )
-            return result
+            return _start_backend_schedule_job()
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     try:
         return _load_latest_schedule()
     except HTTPException as latest_error:
-        try:
-            result = _start_backend_schedule_job()
-            result["message"] = (
-                "No saved schedule exists yet. "
-                "Schedule generation started in the background; open latestUrl after completion."
-            )
-            return result
-        except Exception as exc:
-            raise HTTPException(status_code=latest_error.status_code, detail=latest_error.detail) from exc
+        raise latest_error
