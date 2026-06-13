@@ -2,6 +2,8 @@ import math
 from collections import defaultdict
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from aptech_ara import build_aptech_ara_output
+
 
 ARABIC_ONLINE_COURSES = set()
 ONLINE_RECORDED_COURSES = set()
@@ -282,6 +284,10 @@ class SchedulingEngine:
             "collegeCourses": self._simplify_courses_output(college_courses_output),
             "arabicCourses": self._simplify_courses_output(arabic_courses_output),
             "aptechCourses": aptech_courses_output,
+            "aptechAra": build_aptech_ara_output(
+                self._simplify_courses_output(arabic_courses_output),
+                aptech_courses_output,
+            ),
 
             "schedulesByType": {
                 "college": self._simplify_courses_output(college_courses_output),
@@ -3714,6 +3720,12 @@ class SchedulingEngine:
                     "levels": self._normalize_levels(course),
                     "departments": self._normalize_departments(course.get("departments")),
                     "totalStudentCount": self._safe_int(course.get("totalStudentCount"), 0),
+                    "aptechMode": "COMPUTER",
+                    "schedulingRule": "TA_APTECH_DAY",
+                    "inputInstructorCount": self._aptech_course_instructor_count(course),
+                    "inputAvailabilityCount": self._aptech_course_availability_count(course),
+                    "usedInstructorCount": self._aptech_used_instructor_count(assignments),
+                    "generatedSessionCount": len(assignments),
                     "dayOfWeek": primary_assignment.get("dayOfWeek"),
                     "timeSlot": primary_assignment.get("timeSlot"),
                     "sessions": assignments,
@@ -3742,6 +3754,12 @@ class SchedulingEngine:
                     "levels": self._normalize_levels(course),
                     "departments": self._normalize_departments(course.get("departments")),
                     "totalStudentCount": self._safe_int(course.get("totalStudentCount"), 0),
+                    "aptechMode": "ENGLISH",
+                    "schedulingRule": "INSTRUCTOR_AVAILABILITY",
+                    "inputInstructorCount": self._aptech_course_instructor_count(course),
+                    "inputAvailabilityCount": self._aptech_course_availability_count(course),
+                    "usedInstructorCount": self._aptech_used_instructor_count(assignments),
+                    "generatedSessionCount": len(assignments),
                     "dayOfWeek": primary_assignment.get("dayOfWeek"),
                     "timeSlot": primary_assignment.get("timeSlot"),
                     "sessions": assignments,
@@ -3805,6 +3823,12 @@ class SchedulingEngine:
                 "levels": self._normalize_levels(course),
                 "departments": self._normalize_departments(course.get("departments")),
                 "totalStudentCount": self._safe_int(course.get("totalStudentCount"), 0),
+                "aptechMode": "GENERIC",
+                "schedulingRule": "COURSE_OR_ASSIGNED_INSTRUCTOR_AVAILABILITY",
+                "inputInstructorCount": self._aptech_course_instructor_count(course),
+                "inputAvailabilityCount": self._aptech_course_availability_count(course),
+                "usedInstructorCount": self._aptech_used_instructor_count(assignments),
+                "generatedSessionCount": len(assignments),
                 "dayOfWeek": primary_assignment.get("dayOfWeek"),
                 "timeSlot": primary_assignment.get("timeSlot"),
                 "sessions": assignments,
@@ -3813,6 +3837,26 @@ class SchedulingEngine:
             })
 
         return sorted(result, key=self._course_output_sort_key)
+
+    def _aptech_course_instructor_count(self, course: dict) -> int:
+        instructors = course.get("instructors")
+        return len(instructors) if isinstance(instructors, list) else 0
+
+    def _aptech_course_availability_count(self, course: dict) -> int:
+        count = 0
+        for instructor in course.get("instructors") or []:
+            if not isinstance(instructor, dict):
+                continue
+            count += len(instructor.get("availabilities") or [])
+        return count
+
+    def _aptech_used_instructor_count(self, sessions: List[dict]) -> int:
+        identities = {
+            session.get("instructorId") or self._normalized_person_name(session.get("instructorName"))
+            for session in sessions
+            if session.get("instructorId") is not None or session.get("instructorName")
+        }
+        return len({identity for identity in identities if identity not in (None, "")})
 
     def _aptech_computer_availabilities_for_ta(self, instructor: dict) -> List[dict]:
         instructor_id = instructor.get("instructorId")
@@ -3982,6 +4026,17 @@ class SchedulingEngine:
                 "instructorId": instructor.get("instructorId"),
                 "instructorName": instructor.get("name"),
                 "instructorType": instructor.get("instructorType") or "TA",
+                "aptechMode": "COMPUTER",
+                "schedulingRule": "TA_APTECH_DAY",
+                "sourceAvailability": {
+                    "dayOfWeek": day,
+                    "startTime": start,
+                    "endTime": end,
+                },
+                "sourceInstructorId": instructor.get("instructorId"),
+                "sourceInstructorName": instructor.get("name"),
+                "aptechDay": day,
+                "aptechGroupNumber": group_index,
                 "roomId": None,
                 "roomNumber": "ONLINE",
                 "roomType": "ONLINE",
@@ -4375,6 +4430,16 @@ class SchedulingEngine:
                         "instructorId": instructor_id,
                         "instructorName": instructor_name,
                         "instructorType": instructor_type,
+                        "aptechMode": "ENGLISH",
+                        "schedulingRule": "INSTRUCTOR_AVAILABILITY",
+                        "sourceAvailability": {
+                            "dayOfWeek": day,
+                            "startTime": start,
+                            "endTime": end,
+                        },
+                        "sourceInstructorId": instructor_id,
+                        "sourceInstructorName": instructor_name,
+                        "aptechGroupNumber": len(assignments) + 1,
                         "roomId": None,
                         "roomNumber": "ONLINE",
                         "roomType": "ONLINE",
