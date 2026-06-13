@@ -22,11 +22,22 @@ BACKEND_FETCH_TIMEOUT_SECONDS = int(os.getenv("BACKEND_FETCH_TIMEOUT_SECONDS", "
 SCHEDULER_TIMEOUT_SECONDS = int(os.getenv("SCHEDULER_TIMEOUT_SECONDS", "1200"))
 SCHEDULER_JOB_WORKERS = int(os.getenv("SCHEDULER_JOB_WORKERS", "1"))
 LATEST_SCHEDULE_FILE = Path(os.getenv("LATEST_SCHEDULE_FILE", "latest_schedule.json"))
+GENERATION_STATUS_FILE = Path(
+    os.getenv("GENERATION_STATUS_FILE", "latest_schedule_status.json")
+)
+SCHEDULE_OUTPUT_VERSION = "20260613-two-links-aptech-fixed-v2"
 
 app = FastAPI(title="AD Scheduling API")
 job_executor = ThreadPoolExecutor(max_workers=max(1, SCHEDULER_JOB_WORKERS))
 jobs: Dict[str, Dict[str, Any]] = {}
 jobs_lock = Lock()
+
+
+def _write_json_atomic(path: Path, data: Dict[str, Any]) -> None:
+    temp_path = path.with_suffix(".tmp")
+    with temp_path.open("w", encoding="utf-8") as file:
+        json.dump(data, file, ensure_ascii=False)
+    temp_path.replace(path)
 
 
 def _run_scheduler_worker(payload: Dict[str, Any], result_queue) -> None:
@@ -95,10 +106,34 @@ def _payload_counts(payload: Dict[str, Any]) -> Dict[str, int]:
 
 
 def _save_latest_schedule(result: Dict[str, Any]) -> None:
-    temp_path = LATEST_SCHEDULE_FILE.with_suffix(".tmp")
-    with temp_path.open("w", encoding="utf-8") as file:
-        json.dump(result, file, ensure_ascii=False)
-    temp_path.replace(LATEST_SCHEDULE_FILE)
+    result.setdefault("metadata", {})
+    result["metadata"]["apiCodeVersion"] = SCHEDULE_OUTPUT_VERSION
+    _write_json_atomic(LATEST_SCHEDULE_FILE, result)
+
+
+def _save_generation_status(status: Dict[str, Any]) -> None:
+    status = {
+        "apiCodeVersion": SCHEDULE_OUTPUT_VERSION,
+        "updatedAt": round(time.time(), 3),
+        **status,
+    }
+    _write_json_atomic(GENERATION_STATUS_FILE, status)
+
+
+def _load_generation_status() -> Dict[str, Any]:
+    if not GENERATION_STATUS_FILE.exists():
+        return {}
+
+    try:
+        with GENERATION_STATUS_FILE.open("r", encoding="utf-8") as file:
+            status = json.load(file)
+    except Exception:
+        return {}
+
+    if status.get("apiCodeVersion") != SCHEDULE_OUTPUT_VERSION:
+        return {}
+
+    return status
 
 
 def _load_latest_schedule() -> Dict[str, Any]:
@@ -112,33 +147,91 @@ def _load_latest_schedule() -> Dict[str, Any]:
         )
 
     with LATEST_SCHEDULE_FILE.open("r", encoding="utf-8") as file:
-        return json.load(file)
+        result = json.load(file)
 
+    if result.get("metadata", {}).get("apiCodeVersion") != SCHEDULE_OUTPUT_VERSION:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "The saved schedule belongs to an older code version. "
+                "Open /schedule/from-backend?refresh=true to generate a fresh schedule."
+            ),
+        )
 
-def _run_scheduler_job(payload: Dict[str, Any], fetch_seconds: float) -> Dict[str, Any]:
-    started = time.perf_counter()
-    result = run_scheduler(payload)
-    result.setdefault("metadata", {})
-    result["metadata"]["apiTimingSeconds"] = {
-        "fetchBackend": round(fetch_seconds, 3),
-        "schedule": round(time.perf_counter() - started, 3),
-        "total": round(fetch_seconds + time.perf_counter() - started, 3),
-    }
-    _save_latest_schedule(result)
     return result
+
+
+def _run_scheduler_job(
+    payload: Dict[str, Any],
+    fetch_seconds: float,
+    job_id: str,
+    raw_counts: Dict[str, int],
+    created_at: float,
+) -> Dict[str, Any]:
+    started = time.perf_counter()
+    try:
+        result = _run_scheduler_with_timeout(payload, SCHEDULER_TIMEOUT_SECONDS)
+        elapsed = time.perf_counter() - started
+        result.setdefault("metadata", {})
+        result["metadata"]["apiTimingSeconds"] = {
+            "fetchBackend": round(fetch_seconds, 3),
+            "schedule": round(elapsed, 3),
+            "total": round(fetch_seconds + elapsed, 3),
+        }
+        _save_latest_schedule(result)
+        _save_generation_status({
+            "jobId": job_id,
+            "status": "completed",
+            "elapsedSeconds": round(time.time() - created_at, 3),
+            "fetchSeconds": round(fetch_seconds, 3),
+            "rawCounts": raw_counts,
+            "totalSessions": result.get("totalSessions"),
+            "message": "Schedule generation completed. Open /schedule/from-backend.",
+        })
+        return result
+    except Exception as exc:
+        _save_generation_status({
+            "jobId": job_id,
+            "status": "failed",
+            "elapsedSeconds": round(time.time() - created_at, 3),
+            "fetchSeconds": round(fetch_seconds, 3),
+            "rawCounts": raw_counts,
+            "error": str(exc),
+            "message": "Schedule generation failed. Check Render logs and refresh again after fixing the issue.",
+        })
+        raise
 
 
 def _create_job(payload: Dict[str, Any], fetch_seconds: float) -> Dict[str, Any]:
     job_id = uuid4().hex
-    future = job_executor.submit(_run_scheduler_job, payload, fetch_seconds)
     created_at = time.time()
+    raw_counts = _payload_counts(payload)
+    _save_generation_status({
+        "jobId": job_id,
+        "status": "running",
+        "elapsedSeconds": 0,
+        "fetchSeconds": round(fetch_seconds, 3),
+        "rawCounts": raw_counts,
+        "message": (
+            "Schedule generation started in the background. "
+            "Open /schedule/from-backend after a few minutes."
+        ),
+    })
+    future = job_executor.submit(
+        _run_scheduler_job,
+        payload,
+        fetch_seconds,
+        job_id,
+        raw_counts,
+        created_at,
+    )
     with jobs_lock:
         jobs[job_id] = {
             "jobId": job_id,
             "status": "running",
             "createdAt": created_at,
             "fetchSeconds": round(fetch_seconds, 3),
-            "rawCounts": _payload_counts(payload),
+            "rawCounts": raw_counts,
             "future": future,
         }
 
@@ -146,7 +239,7 @@ def _create_job(payload: Dict[str, Any], fetch_seconds: float) -> Dict[str, Any]
         "jobId": job_id,
         "status": "running",
         "fetchSeconds": round(fetch_seconds, 3),
-        "rawCounts": _payload_counts(payload),
+        "rawCounts": raw_counts,
         "message": (
             "Schedule generation started in the background. "
             "Open /schedule/from-backend after a few minutes to get the generated schedule."
@@ -176,6 +269,41 @@ def _running_job_summary() -> Dict[str, Any]:
         }
 
     return {}
+
+
+def _active_generation_status() -> Dict[str, Any]:
+    running = _running_job_summary()
+    if running:
+        return running
+
+    status = _load_generation_status()
+    if not status:
+        return {}
+
+    if status.get("status") == "running":
+        created_or_updated = float(status.get("updatedAt") or 0)
+        elapsed = time.time() - created_or_updated
+        if elapsed <= SCHEDULER_TIMEOUT_SECONDS + 60:
+            return {
+                **status,
+                "elapsedSeconds": round(elapsed, 3),
+                "message": (
+                    "Schedule generation may still be running. "
+                    "If this stays for more than 20 minutes, restart the Render service."
+                ),
+            }
+
+        return {
+            **status,
+            "status": "stale",
+            "elapsedSeconds": round(elapsed, 3),
+            "message": (
+                "The previous generation appears stale. "
+                "Open /schedule/from-backend?refresh=true to start a new one."
+            ),
+        }
+
+    return status
 
 
 def _start_backend_schedule_job() -> Dict[str, Any]:
@@ -273,4 +401,7 @@ def generate_schedule_from_backend(refresh: bool = False) -> Dict[str, Any]:
     try:
         return _load_latest_schedule()
     except HTTPException as latest_error:
+        status = _active_generation_status()
+        if status:
+            return status
         raise latest_error
