@@ -1,5 +1,6 @@
 import multiprocessing as mp
 import json
+import multiprocessing as mp
 import os
 import queue
 import time
@@ -25,7 +26,7 @@ LATEST_SCHEDULE_FILE = Path(os.getenv("LATEST_SCHEDULE_FILE", "latest_schedule.j
 GENERATION_STATUS_FILE = Path(
     os.getenv("GENERATION_STATUS_FILE", "latest_schedule_status.json")
 )
-SCHEDULE_OUTPUT_VERSION = "20260613-two-links-aptech-fixed-v2"
+SCHEDULE_OUTPUT_VERSION = "20260615-week-balanced-aptech-direct-job-v3"
 
 app = FastAPI(title="AD Scheduling API")
 job_executor = ThreadPoolExecutor(max_workers=max(1, SCHEDULER_JOB_WORKERS))
@@ -170,7 +171,7 @@ def _run_scheduler_job(
 ) -> Dict[str, Any]:
     started = time.perf_counter()
     try:
-        result = _run_scheduler_with_timeout(payload, SCHEDULER_TIMEOUT_SECONDS)
+        result = run_scheduler(payload)
         elapsed = time.perf_counter() - started
         result.setdefault("metadata", {})
         result["metadata"]["apiTimingSeconds"] = {
