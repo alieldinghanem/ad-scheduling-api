@@ -3887,8 +3887,8 @@ class SchedulingEngine:
 
             candidates.append((
                 (
-                    -len(free_slots),
                     self.days.index(day) if day in self.days else 999,
+                    -len(free_slots),
                     normalized_day,
                 ),
                 normalized_day,
@@ -3898,15 +3898,18 @@ class SchedulingEngine:
         if not candidates:
             return []
 
-        _, selected_day, selected_slots = min(candidates, key=lambda item: item[0])
-        return [
-            {
-                "dayOfWeek": selected_day,
-                "startTime": slot.split("-", 1)[0],
-                "endTime": slot.split("-", 1)[1],
-            }
-            for slot in selected_slots
-        ]
+        availabilities = []
+        for _, selected_day, selected_slots in sorted(candidates, key=lambda item: item[0]):
+            availabilities.extend(
+                {
+                    "dayOfWeek": selected_day,
+                    "startTime": slot.split("-", 1)[0],
+                    "endTime": slot.split("-", 1)[1],
+                }
+                for slot in selected_slots
+            )
+
+        return availabilities
 
     def _aptech_group_sizes(self, course: dict) -> List[int]:
         total = self._safe_int(course.get("totalStudentCount"), 0)
@@ -3925,6 +3928,19 @@ class SchedulingEngine:
         group_count = max(1, math.ceil(total / max_group_size))
         return self._distribute_group_to_sections(total, group_count, max_group_size) or [total]
 
+    def _aptech_group_sizes_for_count(self, course: dict, group_count: int) -> List[int]:
+        group_count = max(1, group_count)
+        total = self._safe_int(course.get("totalStudentCount"), 0)
+        if total <= 0:
+            return [0 for _ in range(group_count)]
+
+        base = total // group_count
+        remainder = total % group_count
+        return [
+            base + (1 if index < remainder else 0)
+            for index in range(group_count)
+        ]
+
     def _choose_aptech_computer_assignments(
         self,
         course: dict,
@@ -3936,13 +3952,14 @@ class SchedulingEngine:
         course_name_ar = course.get("courseNameAr")
         levels = self._normalize_levels(course)
         primary_level = levels[0] if levels else None
-        group_sizes = self._aptech_group_sizes(course)
+        minimum_group_count = len(self._aptech_group_sizes(course))
         slots_order = {
             slot: index
             for index, slot in enumerate(self.input_data.get("aptechTimeSlots") or self.regular_slots)
         }
         day_order = {day: index for index, day in enumerate(self.days)}
         candidates = []
+        first_candidate_by_identity = {}
 
         for instructor in instructors:
             if instructor.get("instructorType") != "TA":
@@ -3987,26 +4004,93 @@ class SchedulingEngine:
                     ))
 
         candidates.sort(key=lambda item: item[0])
-        assignments = []
-        used_keys = set()
+        candidates_by_identity = defaultdict(list)
+        for candidate in candidates:
+            _, _, identity, _, _ = candidate
+            first_candidate_by_identity.setdefault(identity, candidate)
+            candidates_by_identity[identity].append(candidate)
 
-        for group_index, group_size in enumerate(group_sizes, start=1):
-            selected = None
+        selected_candidates = []
+        used_keys = set()
+        day_load = defaultdict(int)
+
+        identity_order = sorted(
+            candidates_by_identity,
+            key=lambda identity: (
+                len({candidate[3] for candidate in candidates_by_identity[identity]}),
+                len(candidates_by_identity[identity]),
+                first_candidate_by_identity[identity][0],
+            ),
+        )
+
+        for identity in identity_order:
+            available = []
+            for candidate in candidates_by_identity[identity]:
+                _, _, candidate_identity, day, slot = candidate
+                key = (candidate_identity, day, slot)
+                if key in busy or key in used_keys:
+                    continue
+                available.append(candidate)
+
+            if not available:
+                continue
+
+            selected = min(
+                available,
+                key=lambda candidate: (
+                    day_load[candidate[3]],
+                    slots_order.get(candidate[4], 999),
+                    candidate[0],
+                ),
+            )
+            _, _, selected_identity, selected_day, selected_slot = selected
+            used_keys.add((selected_identity, selected_day, selected_slot))
+            day_load[selected_day] += 1
+            selected_candidates.append(selected)
+
+        while len(selected_candidates) < minimum_group_count:
+            available = []
             for candidate in candidates:
-                _, instructor, identity, day, slot = candidate
+                _, _, identity, day, slot = candidate
                 key = (identity, day, slot)
                 if key in busy or key in used_keys:
                     continue
-                selected = candidate
+                available.append(candidate)
+
+            if not available:
                 break
 
-            if not selected:
-                break
+            selected = min(
+                available,
+                key=lambda candidate: (
+                    day_load[candidate[3]],
+                    slots_order.get(candidate[4], 999),
+                    candidate[0],
+                ),
+            )
+            _, _, selected_identity, selected_day, selected_slot = selected
+            selected_candidates.append(selected)
+            used_keys.add((selected_identity, selected_day, selected_slot))
+            day_load[selected_day] += 1
 
+        selected_candidates.sort(
+            key=lambda candidate: (
+                day_order.get(candidate[3], 999),
+                slots_order.get(candidate[4], 999),
+                candidate[1].get("instructorId") or 0,
+            )
+        )
+
+        group_sizes = self._aptech_group_sizes_for_count(course, len(selected_candidates))
+        assignments = []
+
+        for group_index, (selected, group_size) in enumerate(
+            zip(selected_candidates, group_sizes),
+            start=1,
+        ):
             _, instructor, identity, day, slot = selected
             key = (identity, day, slot)
             busy.add(key)
-            used_keys.add(key)
             start, end = slot.split("-", 1)
             self.session_counter += 1
             assignments.append({
