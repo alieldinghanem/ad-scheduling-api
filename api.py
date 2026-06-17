@@ -26,7 +26,7 @@ LATEST_SCHEDULE_FILE = Path(os.getenv("LATEST_SCHEDULE_FILE", "latest_schedule.j
 GENERATION_STATUS_FILE = Path(
     os.getenv("GENERATION_STATUS_FILE", "latest_schedule_status.json")
 )
-SCHEDULE_OUTPUT_VERSION = "20260615-week-balanced-aptech-direct-job-v3"
+SCHEDULE_OUTPUT_VERSION = "20260617-project-5-7-v4"
 
 app = FastAPI(title="AD Scheduling API")
 job_executor = ThreadPoolExecutor(max_workers=max(1, SCHEDULER_JOB_WORKERS))
