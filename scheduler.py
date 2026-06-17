@@ -5112,8 +5112,17 @@ class SchedulingEngine:
         code = self._course_code(course)
         lab_type = str(course.get("labType") or "").strip().upper()
         schedule_mode = str(course.get("scheduleMode") or "").strip().upper()
+        name = str(course.get("courseName") or "").strip().upper()
+        name_ar = str(course.get("courseNameAr") or "").strip()
 
-        return code in self.project_courses or lab_type == "PROJECT" or schedule_mode == "PROJECT"
+        return (
+            code in self.project_courses
+            or lab_type == "PROJECT"
+            or schedule_mode == "PROJECT"
+            or code in {"CS405", "CS405-P2"}
+            or name in {"PROJECT", "GRADUATION PROJECT"}
+            or name_ar == "\u0645\u0634\u0631\u0648\u0639"
+        )
 
     def _has_instructor_dependent_courses(self) -> bool:
         return any(
