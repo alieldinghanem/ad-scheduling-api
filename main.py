@@ -1,6 +1,7 @@
 import json
 import sys
 from urllib.request import Request, urlopen
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -306,8 +307,36 @@ def is_url(value: str) -> bool:
     return value.lower().startswith(("http://", "https://"))
 
 
-def load_json_from_url(url: str, timeout: int = 60) -> Dict[str, Any]:
-    request = Request(url, headers={"Accept": "application/json"})
+def load_json_from_url(
+    url: str,
+    timeout: int = 60,
+    no_cache: bool = False,
+) -> Dict[str, Any]:
+    """Load JSON from a URL.
+
+    When no_cache=True a unique query parameter and explicit no-cache headers
+    are added. This is used by the API refresh endpoint so every generation
+    consumes the newest backend payload instead of a cached HTTP response.
+    """
+    request_url = url
+    headers = {"Accept": "application/json"}
+
+    if no_cache:
+        parts = urlsplit(url)
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        query["_adex_refresh"] = str(int(__import__("time").time() * 1000))
+        request_url = urlunsplit(
+            (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+        )
+        headers.update(
+            {
+                "Cache-Control": "no-cache, no-store, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            }
+        )
+
+    request = Request(request_url, headers=headers)
     with urlopen(request, timeout=timeout) as response:
         charset = response.headers.get_content_charset() or "utf-8"
         return json.loads(response.read().decode(charset))
