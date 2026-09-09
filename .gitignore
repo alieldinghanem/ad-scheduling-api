@@ -1,0 +1,12 @@
+# Runtime-generated scheduling artifacts
+latest_schedule.json
+latest_schedule_status.json
+latest_input.json
+output_schedule.json
+backend_input.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
