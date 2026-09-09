@@ -1,0 +1,63 @@
+name: Runtime smoke v3
+
+on:
+  push:
+    branches:
+      - fix/render-worker-v3
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - name: Compile
+        run: python -m py_compile api.py main.py scheduler.py scheduler_performance.py sitecustomize.py
+      - name: Import API
+        run: python - <<'PY'
+          import api
+          assert api.SCHEDULE_OUTPUT_VERSION == '20260910-render-low-memory-v3'
+          print('api import ok')
+          PY
+      - name: Normalize live backend payload
+        run: python - <<'PY'
+          from main import load_json_from_url, normalize_payload
+          payload = load_json_from_url('https://nub-adex.runasp.net/api/Scheduling/ai-data', timeout=60, no_cache=True)
+          normalized = normalize_payload(payload)
+          assert str(normalized.get('semesterId')) == '35', normalized.get('semesterId')
+          assert len(normalized.get('regularCourses') or []) > 0
+          assert len(normalized.get('rooms') or []) > 0
+          print('semester', normalized.get('semesterId'))
+          print('regularCourses', len(normalized.get('regularCourses') or []))
+          print('rooms', len(normalized.get('rooms') or []))
+          PY
+      - name: Minimal scheduler run
+        run: python - <<'PY'
+          from main import run_scheduler
+          payload = {
+              'semesterId': 35,
+              'days': ['Saturday'],
+              'regularTimeSlots': ['09:00-11:00'],
+              'targetGroupSize': 150,
+              'sectionCapacity': 50,
+              'regularCourses': [],
+              'arabicCourses': [],
+              'aptechCourses': [],
+              'regularInstructors': [],
+              'arabicInstructors': [],
+              'aptechInstructors': [],
+              'rooms': [],
+              'studentGroups': [],
+          }
+          result = run_scheduler(payload)
+          assert isinstance(result, dict)
+          assert result.get('metadata', {}).get('semesterId') in (None, 35)
+          print(result.get('message'))
+          PY
