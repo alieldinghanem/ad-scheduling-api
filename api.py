@@ -1,3 +1,4 @@
+import hashlib
 import json
 import multiprocessing as mp
 import os
@@ -6,10 +7,11 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 
 from main import load_json_from_url, run_scheduler
 
@@ -21,16 +23,87 @@ BACKEND_AI_DATA_URL = os.getenv(
 BACKEND_FETCH_TIMEOUT_SECONDS = int(os.getenv("BACKEND_FETCH_TIMEOUT_SECONDS", "60"))
 SCHEDULER_TIMEOUT_SECONDS = int(os.getenv("SCHEDULER_TIMEOUT_SECONDS", "1200"))
 SCHEDULER_JOB_WORKERS = int(os.getenv("SCHEDULER_JOB_WORKERS", "1"))
-LATEST_SCHEDULE_FILE = Path(os.getenv("LATEST_SCHEDULE_FILE", "latest_schedule.json"))
-GENERATION_STATUS_FILE = Path(
-    os.getenv("GENERATION_STATUS_FILE", "latest_schedule_status.json")
+DATA_DIR = Path(os.getenv("SCHEDULER_DATA_DIR", "."))
+LATEST_SCHEDULE_FILE = Path(
+    os.getenv("LATEST_SCHEDULE_FILE", str(DATA_DIR / "latest_schedule.json"))
 )
-SCHEDULE_OUTPUT_VERSION = "20260617-project-5-7-v4"
+GENERATION_STATUS_FILE = Path(
+    os.getenv("GENERATION_STATUS_FILE", str(DATA_DIR / "latest_schedule_status.json"))
+)
+LATEST_INPUT_FILE = Path(
+    os.getenv("LATEST_INPUT_FILE", str(DATA_DIR / "latest_input.json"))
+)
+SCHEDULE_OUTPUT_VERSION = "20260909-fresh-backend-data-v1"
 
 app = FastAPI(title="AD Scheduling API")
 job_executor = ThreadPoolExecutor(max_workers=max(1, SCHEDULER_JOB_WORKERS))
 jobs: Dict[str, Dict[str, Any]] = {}
 jobs_lock = Lock()
+
+
+def _payload_container(payload: Dict[str, Any]) -> Dict[str, Any]:
+    data = payload.get("data")
+    return data if isinstance(data, dict) else payload
+
+
+def _payload_semester_id(payload: Dict[str, Any]) -> Any:
+    container = _payload_container(payload)
+    return container.get("semesterId", payload.get("semesterId"))
+
+
+def _payload_hash(payload: Dict[str, Any]) -> str:
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _same_semester(left: Any, right: Any) -> bool:
+    if left is None or right is None:
+        return left is right
+    return str(left).strip() == str(right).strip()
+
+
+def _save_latest_input(
+    payload: Dict[str, Any],
+    *,
+    fetched_at: float,
+    source_hash: str,
+) -> None:
+    snapshot = {
+        "source": {
+            "backendUrl": BACKEND_AI_DATA_URL,
+            "fetchedAt": round(fetched_at, 3),
+            "semesterId": _payload_semester_id(payload),
+            "dataHash": source_hash,
+            "rawCounts": _payload_counts(payload),
+        },
+        "payload": payload,
+    }
+    _write_json_atomic(LATEST_INPUT_FILE, snapshot)
+
+
+def _load_latest_input() -> Dict[str, Any]:
+    if not LATEST_INPUT_FILE.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="No backend input snapshot has been fetched yet. Use refresh=true first.",
+        )
+    try:
+        with LATEST_INPUT_FILE.open("r", encoding="utf-8") as file:
+            snapshot = json.load(file)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not read latest backend input snapshot: {exc}",
+        ) from exc
+    if not isinstance(snapshot, dict):
+        raise HTTPException(status_code=500, detail="Latest input snapshot is invalid.")
+    return snapshot
 
 
 def _write_json_atomic(path: Path, data: Dict[str, Any]) -> None:
@@ -118,7 +191,7 @@ def _run_scheduler_with_timeout(
 
 
 def _payload_counts(payload: Dict[str, Any]) -> Dict[str, int]:
-    container = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    container = _payload_container(payload)
     return {
         "regularCourses": len(container.get("regularCourses") or []),
         "arabicCourses": len(container.get("arabicCourses") or []),
@@ -131,9 +204,22 @@ def _payload_counts(payload: Dict[str, Any]) -> Dict[str, int]:
     }
 
 
-def _save_latest_schedule(result: Dict[str, Any]) -> None:
+def _save_latest_schedule(
+    result: Dict[str, Any],
+    *,
+    source_semester_id: Any,
+    source_hash: str,
+    source_fetched_at: float,
+) -> None:
     result.setdefault("metadata", {})
-    result["metadata"]["apiCodeVersion"] = SCHEDULE_OUTPUT_VERSION
+    result["metadata"].update(
+        {
+            "apiCodeVersion": SCHEDULE_OUTPUT_VERSION,
+            "sourceSemesterId": source_semester_id,
+            "sourceDataHash": source_hash,
+            "sourceFetchedAt": round(source_fetched_at, 3),
+        }
+    )
     _write_json_atomic(LATEST_SCHEDULE_FILE, result)
 
 
@@ -168,21 +254,13 @@ def _load_generation_status() -> Dict[str, Any]:
 
 
 def _load_latest_schedule() -> Dict[str, Any]:
-    """
-    Return the latest valid saved schedule.
-
-    Important: a previously generated schedule remains readable after an API
-    deployment. New schedules still receive apiCodeVersion when saved, but the
-    endpoint does not reject a usable schedule only because its version tag is
-    missing or older.
-    """
+    """Return only a schedule generated from a verified backend input snapshot."""
     if not LATEST_SCHEDULE_FILE.exists():
         raise HTTPException(
             status_code=404,
             detail=(
-                "No schedule has been generated yet. "
-                "Open /schedule/from-backend?refresh=true once, then use "
-                "/schedule/from-backend."
+                "No verified schedule has been generated from the current backend data. "
+                "Open /schedule/from-backend?refresh=true once and follow /schedule/status."
             ),
         )
 
@@ -196,9 +274,27 @@ def _load_latest_schedule() -> Dict[str, Any]:
         ) from exc
 
     if not isinstance(result, dict):
+        raise HTTPException(status_code=500, detail="Saved schedule is not a valid JSON object.")
+
+    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    if not metadata.get("sourceDataHash") or "sourceSemesterId" not in metadata:
         raise HTTPException(
-            status_code=500,
-            detail="Saved schedule is not a valid JSON object.",
+            status_code=409,
+            detail=(
+                "The saved schedule is a legacy/stale file and is intentionally blocked. "
+                "Generate a fresh schedule with /schedule/from-backend?refresh=true."
+            ),
+        )
+
+    output_semester = metadata.get("semesterId")
+    source_semester = metadata.get("sourceSemesterId")
+    if not _same_semester(output_semester, source_semester):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Saved schedule semester mismatch: output={output_semester}, "
+                f"source={source_semester}. Generate a fresh schedule."
+            ),
         )
 
     return result
@@ -210,6 +306,9 @@ def _run_scheduler_job(
     job_id: str,
     raw_counts: Dict[str, int],
     created_at: float,
+    source_semester_id: Any,
+    source_hash: str,
+    source_fetched_at: float,
 ) -> Dict[str, Any]:
     started = time.perf_counter()
 
@@ -219,6 +318,14 @@ def _run_scheduler_job(
         elapsed = time.perf_counter() - started
 
         result.setdefault("metadata", {})
+        output_semester_id = result["metadata"].get("semesterId")
+        if not _same_semester(output_semester_id, source_semester_id):
+            raise RuntimeError(
+                "Scheduler output was generated for a different semester: "
+                f"source={source_semester_id}, output={output_semester_id}. "
+                "The stale result was NOT saved."
+            )
+
         result["metadata"]["apiTimingSeconds"] = {
             "fetchBackend": round(fetch_seconds, 3),
             "schedule": round(elapsed, 3),
@@ -226,7 +333,12 @@ def _run_scheduler_job(
         }
 
         # Only replace the latest schedule after a successful generation.
-        _save_latest_schedule(result)
+        _save_latest_schedule(
+            result,
+            source_semester_id=source_semester_id,
+            source_hash=source_hash,
+            source_fetched_at=source_fetched_at,
+        )
         _save_generation_status(
             {
                 "jobId": job_id,
@@ -234,6 +346,8 @@ def _run_scheduler_job(
                 "elapsedSeconds": round(time.time() - created_at, 3),
                 "fetchSeconds": round(fetch_seconds, 3),
                 "rawCounts": raw_counts,
+                "sourceSemesterId": source_semester_id,
+                "sourceDataHash": source_hash,
                 "totalSessions": result.get("totalSessions"),
                 "message": (
                     "Schedule generation completed. "
@@ -252,6 +366,8 @@ def _run_scheduler_job(
                 "elapsedSeconds": round(time.time() - created_at, 3),
                 "fetchSeconds": round(fetch_seconds, 3),
                 "rawCounts": raw_counts,
+                "sourceSemesterId": source_semester_id,
+                "sourceDataHash": source_hash,
                 "error": str(exc),
                 "message": (
                     "Schedule generation timed out. "
@@ -271,6 +387,8 @@ def _run_scheduler_job(
                 "elapsedSeconds": round(time.time() - created_at, 3),
                 "fetchSeconds": round(fetch_seconds, 3),
                 "rawCounts": raw_counts,
+                "sourceSemesterId": source_semester_id,
+                "sourceDataHash": source_hash,
                 "error": str(exc),
                 "message": (
                     "Schedule generation failed. Check Render logs. "
@@ -285,6 +403,14 @@ def _create_job(payload: Dict[str, Any], fetch_seconds: float) -> Dict[str, Any]
     job_id = uuid4().hex
     created_at = time.time()
     raw_counts = _payload_counts(payload)
+    source_semester_id = _payload_semester_id(payload)
+    source_hash = _payload_hash(payload)
+    source_fetched_at = time.time()
+    _save_latest_input(
+        payload,
+        fetched_at=source_fetched_at,
+        source_hash=source_hash,
+    )
 
     _save_generation_status(
         {
@@ -294,6 +420,8 @@ def _create_job(payload: Dict[str, Any], fetch_seconds: float) -> Dict[str, Any]
             "elapsedSeconds": 0,
             "fetchSeconds": round(fetch_seconds, 3),
             "rawCounts": raw_counts,
+            "sourceSemesterId": source_semester_id,
+            "sourceDataHash": source_hash,
             "timeoutSeconds": SCHEDULER_TIMEOUT_SECONDS,
             "message": (
                 "Schedule generation started in the background. "
@@ -309,6 +437,9 @@ def _create_job(payload: Dict[str, Any], fetch_seconds: float) -> Dict[str, Any]
         job_id,
         raw_counts,
         created_at,
+        source_semester_id,
+        source_hash,
+        source_fetched_at,
     )
 
     with jobs_lock:
@@ -318,6 +449,8 @@ def _create_job(payload: Dict[str, Any], fetch_seconds: float) -> Dict[str, Any]
             "createdAt": created_at,
             "fetchSeconds": round(fetch_seconds, 3),
             "rawCounts": raw_counts,
+            "sourceSemesterId": source_semester_id,
+            "sourceDataHash": source_hash,
             "future": future,
         }
 
@@ -326,6 +459,8 @@ def _create_job(payload: Dict[str, Any], fetch_seconds: float) -> Dict[str, Any]
         "status": "running",
         "fetchSeconds": round(fetch_seconds, 3),
         "rawCounts": raw_counts,
+        "sourceSemesterId": source_semester_id,
+        "sourceDataHash": source_hash,
         "timeoutSeconds": SCHEDULER_TIMEOUT_SECONDS,
         "message": (
             "Schedule generation started in the background. "
@@ -350,6 +485,8 @@ def _running_job_summary() -> Dict[str, Any]:
             "elapsedSeconds": round(time.time() - job["createdAt"], 3),
             "fetchSeconds": job["fetchSeconds"],
             "rawCounts": job["rawCounts"],
+            "sourceSemesterId": job.get("sourceSemesterId"),
+            "sourceDataHash": job.get("sourceDataHash"),
             "timeoutSeconds": SCHEDULER_TIMEOUT_SECONDS,
             "message": (
                 "A schedule generation job is running. "
@@ -399,6 +536,7 @@ def _start_backend_schedule_job() -> Dict[str, Any]:
     payload = load_json_from_url(
         BACKEND_AI_DATA_URL,
         timeout=BACKEND_FETCH_TIMEOUT_SECONDS,
+        no_cache=True,
     )
     fetch_seconds = time.perf_counter() - started
     return _create_job(payload, fetch_seconds)
@@ -424,6 +562,8 @@ def _resolve_job(job_id: str) -> Dict[str, Any]:
             "elapsedSeconds": elapsed,
             "fetchSeconds": job["fetchSeconds"],
             "rawCounts": job["rawCounts"],
+            "sourceSemesterId": job.get("sourceSemesterId"),
+            "sourceDataHash": job.get("sourceDataHash"),
             "timeoutSeconds": SCHEDULER_TIMEOUT_SECONDS,
         }
 
@@ -482,6 +622,12 @@ def get_schedule_job(job_id: str) -> Dict[str, Any]:
     return _resolve_job(job_id)
 
 
+@app.get("/schedule/input/latest")
+def latest_backend_input() -> Dict[str, Any]:
+    """Return the exact backend payload used by the latest generation request."""
+    return _load_latest_input()
+
+
 @app.get("/schedule/latest")
 def latest_schedule() -> Dict[str, Any]:
     return _load_latest_schedule()
@@ -496,7 +642,26 @@ def generate_schedule(payload: Dict[str, Any]) -> Dict[str, Any]:
         result["metadata"]["apiTimingSeconds"] = {
             "schedule": round(time.perf_counter() - started, 3),
         }
-        _save_latest_schedule(result)
+        source_semester_id = _payload_semester_id(payload)
+        source_hash = _payload_hash(payload)
+        source_fetched_at = time.time()
+        output_semester_id = result.get("metadata", {}).get("semesterId")
+        if not _same_semester(output_semester_id, source_semester_id):
+            raise RuntimeError(
+                f"Scheduler output semester mismatch: source={source_semester_id}, "
+                f"output={output_semester_id}."
+            )
+        _save_latest_input(
+            payload,
+            fetched_at=source_fetched_at,
+            source_hash=source_hash,
+        )
+        _save_latest_schedule(
+            result,
+            source_semester_id=source_semester_id,
+            source_hash=source_hash,
+            source_fetched_at=source_fetched_at,
+        )
         return result
     except TimeoutError as exc:
         raise HTTPException(status_code=504, detail=str(exc)) from exc
@@ -512,6 +677,11 @@ def generate_schedule_from_backend(refresh: bool = False) -> Dict[str, Any]:
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    # The normal endpoint always serves the last successfully saved schedule.
-    # Generation status is available separately at /schedule/status.
+    # Never silently serve an old schedule while a fresh generation is running.
+    # This prevents the frontend/backend from mistaking a legacy file for the
+    # newly requested timetable.
+    running = _running_job_summary()
+    if running:
+        return JSONResponse(status_code=202, content=running)
+
     return _load_latest_schedule()
