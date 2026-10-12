@@ -1,0 +1,19 @@
+{
+  "semesterId": 1,
+  "days": [
+    "Saturday"
+  ],
+  "regularTimeSlots": [
+    "09:00-11:00"
+  ],
+  "targetGroupSize": 150,
+  "sectionCapacity": 50,
+  "regularCourses": [],
+  "arabicCourses": [],
+  "aptechCourses": [],
+  "regularInstructors": [],
+  "arabicInstructors": [],
+  "aptechInstructors": [],
+  "rooms": [],
+  "studentGroups": []
+}
