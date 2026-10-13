@@ -63,11 +63,15 @@ scheduler.py                   Core scheduling and constraint validation
 scheduler_performance.py       Selected scheduling performance optimizations
 aptech_ara.py                  Arabic / APTECH schedule output processing
 sitecustomize.py               Performance patch bootstrap
-sample_data/sample_input.json  Synthetic schema example (no real records)
-tests/test_smoke.py            Basic normalization and patch smoke tests
-.github/workflows/            CI smoke-check workflows
-.env.example                   Example runtime configuration
-requirements.txt               Python dependencies
+sample_data/sample_input.json       Empty synthetic schema example
+sample_data/demo_academic_input.json Synthetic 2-course functional demo
+tests/test_smoke.py             Normalization and patch smoke tests
+tests/test_synthetic_schedule.py End-to-end demo scheduling tests
+tests/test_api_integration.py   API routes and background-job integration tests
+.github/workflows/             Automated CI validation
+.env.example                    Opt-in backend environment configuration
+requirements.txt                Application dependencies
+requirements-dev.txt            Additional local test dependencies
 ```
 
 ## Getting started
@@ -104,10 +108,10 @@ uvicorn api:app --reload
 The project supports direct generation from JSON via `POST /schedule` and a CLI:
 
 ```bash
-python main.py sample_data/sample_input.json output_schedule.json
+python main.py sample_data/demo_academic_input.json output_schedule.json
 ```
 
-**Important:** The committed `sample_input.json` deliberately has no courses, instructors, or rooms. It demonstrates the accepted top-level structure, **not a complete working timetable example**; an empty input will produce a failure/diagnostic response. For a meaningful generated timetable, provide a full **synthetic** dataset with matching courses, instructors, availability, and rooms.
+**Demonstration:** `demo_academic_input.json` contains only fake course codes, instructors, room identifiers, availabilities, and student-group counts. It is designed to produce a non-empty schedule. `sample_input.json` is a separate empty schema example and intentionally does not produce a successful schedule. Generated `output_schedule.json` is a local artifact and should not be committed.
 
 ### Relevant API endpoints
 
@@ -126,12 +130,13 @@ python main.py sample_data/sample_input.json output_schedule.json
 ## Testing
 
 ```bash
-python -m unittest tests/test_smoke.py
+python -m pip install -r requirements-dev.txt
+python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-The repository includes basic tests covering input normalization and the performance-patch installation. GitHub Actions workflows add compile and runtime smoke checks under their configured triggers.
+The automated suite includes smoke tests, scheduling against a non-empty synthetic dataset, basic conflict and unscheduled-session assertions, API route validation, stored-result retrieval, and a mocked background-job workflow. GitHub Actions runs these tests and Python compilation checks.
 
-**Current limitation:** The committed smoke tests do not constitute comprehensive end-to-end verification of scheduling quality or all conflict/capacity edge cases.
+**Scope of verification:** The current synthetic suite is a reproducible demonstration, not proof that every possible university timetable or edge case is conflict-free. The original university rollout and Grade A assessment are reported by the project author.
 
 ## Security and privacy
 
@@ -143,12 +148,12 @@ The repository includes basic tests covering input normalization and the perform
 
 ## Project status and next improvements
 
-The scheduling engine and API implementation are preserved as developed. Before presenting this repository as a publicly reproducible portfolio project, the main remaining work is:
+The public-portfolio preparation branch includes working synthetic demo data, integration tests and a scoped performance memoization bug fix. **The repository must remain Private until historical academic data is fully removed from Git history across all refs and verified.** Remaining release actions:
 
-1. Audit historic commits and generated-output data for confidentiality.
-2. Add a realistic synthetic fixture producing a non-empty timetable.
-3. Add automated integration/constraint tests for representative conflicts and room capacities.
-4. Validate the documented quick start and CI workflows on a clean environment.
-5. Add endpoint authentication/authorization before connecting a publicly reachable deployment to sensitive university data.
+1. Remove historical real timetable outputs and private identifiers from all Git refs and verify the rewrite (including old branch and PR references).
+2. Review and, where necessary, generalize institution-specific legacy course/room constants without breaking the active university deployment.
+3. Review all license and intellectual-property rights before selecting an open-source license.
+4. Add authentication/authorization **before deploying** this API on the public Internet with real university data; the source repository can be public without the service being publicly exposed.
+5. Merge reviewed changes and rerun CI only after confirming deployment-side `BACKEND_AI_DATA_URL` settings.
 
 **ADEX demonstrates a graduation project evaluated as Excellent (Grade A), tested on real university scheduling inputs, and used in an operational timetable workflow.** It showcases constraint-based scheduling, REST API integration, diagnostics, and performance considerations.
