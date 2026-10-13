@@ -13,10 +13,7 @@ from fastapi.responses import JSONResponse
 
 from main import load_json_from_url, run_scheduler
 
-BACKEND_AI_DATA_URL = os.getenv(
-    "BACKEND_AI_DATA_URL",
-    "https://nub-adex.runasp.net/api/Scheduling/ai-data",
-)
+BACKEND_AI_DATA_URL = os.getenv("BACKEND_AI_DATA_URL", "").strip()
 BACKEND_FETCH_TIMEOUT_SECONDS = int(os.getenv("BACKEND_FETCH_TIMEOUT_SECONDS", "60"))
 SCHEDULER_TIMEOUT_SECONDS = int(os.getenv("SCHEDULER_TIMEOUT_SECONDS", "1200"))
 SCHEDULER_JOB_WORKERS = int(os.getenv("SCHEDULER_JOB_WORKERS", "1"))
@@ -328,6 +325,8 @@ def _active_generation_status() -> Dict[str, Any]:
 
 
 def _start_backend_schedule_job() -> Dict[str, Any]:
+    if not BACKEND_AI_DATA_URL:
+        raise HTTPException(status_code=503, detail="Backend source not configured. Set BACKEND_AI_DATA_URL to an authorized data endpoint.")
     running = _running_job_summary()
     if running:
         return running
