@@ -20,7 +20,8 @@ class DemoSchedulerTests(unittest.TestCase):
         self.assertEqual(len(self.payload["regularCourses"]), 2)
         self.assertEqual(len(self.payload["regularInstructors"]), 2)
         self.assertEqual(len(self.payload["rooms"]), 3)
-        self.assertNotIn("nub-adex", FIXTURE.read_text(encoding="utf-8").lower())
+        self.assertNotIn("http://", FIXTURE.read_text(encoding="utf-8").lower())
+        self.assertNotIn("https://", FIXTURE.read_text(encoding="utf-8").lower())
 
     def test_nonempty_schedule(self):
         self.assertIsInstance(self.result, dict)
