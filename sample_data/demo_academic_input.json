@@ -1,0 +1,149 @@
+{
+  "semesterId": 999,
+  "days": [
+    "Saturday",
+    "Sunday",
+    "Monday",
+    "Tuesday"
+  ],
+  "regularTimeSlots": [
+    "09:00-11:00",
+    "11:00-13:00",
+    "13:00-15:00",
+    "15:00-17:00"
+  ],
+  "arabicOnlineTimeSlots": [
+    "17:00-19:00"
+  ],
+  "targetGroupSize": 50,
+  "sectionCapacity": 25,
+  "regularCourses": [
+    {
+      "courseCode": "DEMO101",
+      "courseName": "Introduction to Computing",
+      "level": 1,
+      "levels": [
+        1
+      ],
+      "enrollmentCount": 40,
+      "totalStudentCount": 40,
+      "labType": "LAB_ONLY",
+      "instructorIds": [
+        1001,
+        1002
+      ],
+      "departments": []
+    },
+    {
+      "courseCode": "DEMO102",
+      "courseName": "Data Literacy",
+      "level": 1,
+      "levels": [
+        1
+      ],
+      "enrollmentCount": 40,
+      "totalStudentCount": 40,
+      "labType": null,
+      "instructorIds": [
+        1001
+      ],
+      "departments": []
+    }
+  ],
+  "regularInstructors": [
+    {
+      "instructorId": 1001,
+      "name": "Instructor 1",
+      "instructorType": "DOCTOR",
+      "assignedCourses": [
+        "DEMO101",
+        "DEMO102"
+      ],
+      "availabilities": [
+        {
+          "dayOfWeek": "Saturday",
+          "startTime": "09:00",
+          "endTime": "17:00",
+          "isAvailable": true
+        },
+        {
+          "dayOfWeek": "Sunday",
+          "startTime": "09:00",
+          "endTime": "17:00",
+          "isAvailable": true
+        },
+        {
+          "dayOfWeek": "Monday",
+          "startTime": "09:00",
+          "endTime": "17:00",
+          "isAvailable": true
+        },
+        {
+          "dayOfWeek": "Tuesday",
+          "startTime": "09:00",
+          "endTime": "17:00",
+          "isAvailable": true
+        }
+      ]
+    },
+    {
+      "instructorId": 1002,
+      "name": "Teaching Assistant 1",
+      "instructorType": "TA",
+      "assignedCourses": [
+        "DEMO101"
+      ],
+      "availabilities": [
+        {
+          "dayOfWeek": "Saturday",
+          "startTime": "09:00",
+          "endTime": "17:00",
+          "isAvailable": true
+        },
+        {
+          "dayOfWeek": "Sunday",
+          "startTime": "09:00",
+          "endTime": "17:00",
+          "isAvailable": true
+        },
+        {
+          "dayOfWeek": "Monday",
+          "startTime": "09:00",
+          "endTime": "17:00",
+          "isAvailable": true
+        },
+        {
+          "dayOfWeek": "Tuesday",
+          "startTime": "09:00",
+          "endTime": "17:00",
+          "isAvailable": true
+        }
+      ]
+    }
+  ],
+  "arabicCourses": [],
+  "aptechCourses": [],
+  "arabicInstructors": [],
+  "aptechInstructors": [],
+  "studentGroups": [],
+  "rooms": [
+    {
+      "roomId": 2001,
+      "roomNumber": "DEMO-LECTURE-1",
+      "roomType": "GENERAL",
+      "capacity": 200
+    },
+    {
+      "roomId": 2002,
+      "roomNumber": "DEMO-LAB-1",
+      "roomType": "LAB_ONLY",
+      "capacity": 30
+    },
+    {
+      "roomId": 2003,
+      "roomNumber": "DEMO-LAB-2",
+      "roomType": "LAB_ONLY",
+      "capacity": 30
+    }
+  ]
+}
