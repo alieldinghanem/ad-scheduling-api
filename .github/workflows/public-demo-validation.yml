@@ -39,3 +39,26 @@ jobs:
           PY
       - name: Run synthetic scheduling tests
         run: python -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: Package clean source
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile, ZIP_DEFLATED
+          import subprocess
+          files = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
+          files = [name for name in files if name]
+          output = Path("dist/ADEX-final-source.zip")
+          output.parent.mkdir(exist_ok=True)
+          with ZipFile(output, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
+              for name in files:
+                  archive.write(name, arcname="ADEX-Academic-Scheduling/" + name)
+          print(f"Packaged {len(files)} tracked files to {output}")
+          PY
+      - name: Upload complete source ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: ADEX-final-source
+          path: dist/ADEX-final-source.zip
+          if-no-files-found: error
+          retention-days: 7
