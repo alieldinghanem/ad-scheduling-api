@@ -4,7 +4,9 @@
 
 ADEX is a university academic scheduling backend that builds lecture, section, and laboratory timetables from structured academic data. Instead of relying on manual timetable assignment, the system applies academic scheduling rules, allocates available resources, and reports conflicts or sessions that could not be scheduled.
 
-Developed as a **graduation project (Grade A)** for a university-scale scenario involving **2,000+ students**, courses, teaching staff, rooms, and student groups. These figures describe the original project scenario, not a benchmark for the included sample input.
+Developed as **my graduation project**, ADEX received an **Excellent (Grade A)** evaluation. It was **successfully tested with real university academic scheduling data** and has been **used for actual timetable-generation workflows**, rather than being limited to a classroom prototype. The scheduling implementation remains in use, as reported by the project author.
+
+The system was built for a university-scale scenario involving **2,000+ students**, courses, teaching staff, rooms, and student groups. These figures describe the original project scenario, not a benchmark for the included synthetic input.
 
 > **Technical scope:** This is a **constraint-based scheduling and backend engineering project**, not a trained machine-learning model. The repository highlights scheduling logic, API design, data normalization, validation, and performance engineering.
 
@@ -149,4 +151,4 @@ The scheduling engine and API implementation are preserved as developed. Before 
 4. Validate the documented quick start and CI workflows on a clean environment.
 5. Add endpoint authentication/authorization before connecting a publicly reachable deployment to sensitive university data.
 
-**ADEX demonstrates the design and implementation of a practical backend scheduling system, including academic constraints, REST API integration, scheduling diagnostics, and performance considerations.**
+**ADEX demonstrates a graduation project evaluated as Excellent (Grade A), tested on real university scheduling inputs, and used in an operational timetable workflow.** It showcases constraint-based scheduling, REST API integration, diagnostics, and performance considerations.
