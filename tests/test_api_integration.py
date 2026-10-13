@@ -60,12 +60,12 @@ class SchedulerAPITests(unittest.TestCase):
         self.assertEqual(snapshot.status_code, 200, snapshot.text)
         self.assertEqual(snapshot.json()["payload"]["semesterId"], 999)
 
-    def test_empty_input_reports_failure_without_500(self):
+    def test_empty_input_rejected_without_500(self):
         invalid = self.payload.copy()
         invalid["regularCourses"] = []
         response = self.client.post("/schedule", json=invalid)
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertFalse(response.json()["success"])
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("detail", response.json())
 
     def test_backend_refresh_without_config_is_rejected(self):
         with patch.object(api, "BACKEND_AI_DATA_URL", ""):
