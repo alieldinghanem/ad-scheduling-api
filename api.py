@@ -1,6 +1,8 @@
 import hashlib
+import hmac
 import json
 import os
+import tempfile
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -8,7 +10,7 @@ from threading import Lock
 from typing import Any, Dict
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from main import load_json_from_url, run_scheduler
@@ -17,6 +19,8 @@ BACKEND_AI_DATA_URL = os.getenv("BACKEND_AI_DATA_URL", "").strip()
 BACKEND_FETCH_TIMEOUT_SECONDS = int(os.getenv("BACKEND_FETCH_TIMEOUT_SECONDS", "60"))
 SCHEDULER_TIMEOUT_SECONDS = int(os.getenv("SCHEDULER_TIMEOUT_SECONDS", "1200"))
 SCHEDULER_JOB_WORKERS = int(os.getenv("SCHEDULER_JOB_WORKERS", "1"))
+MAX_COMPLETED_JOBS = max(1, int(os.getenv("MAX_COMPLETED_JOBS", "8")))
+API_ACCESS_KEY = os.getenv("ADEX_API_KEY", "").strip()
 DATA_DIR = Path(os.getenv("SCHEDULER_DATA_DIR", "."))
 LATEST_SCHEDULE_FILE = Path(os.getenv("LATEST_SCHEDULE_FILE", str(DATA_DIR / "latest_schedule.json")))
 GENERATION_STATUS_FILE = Path(os.getenv("GENERATION_STATUS_FILE", str(DATA_DIR / "latest_schedule_status.json")))
@@ -27,6 +31,17 @@ app = FastAPI(title="AD Scheduling API")
 job_executor = ThreadPoolExecutor(max_workers=max(1, SCHEDULER_JOB_WORKERS))
 jobs: Dict[str, Dict[str, Any]] = {}
 jobs_lock = Lock()
+job_start_lock = Lock()
+
+
+@app.middleware("http")
+async def protect_schedule_endpoints(request: Request, call_next):
+    """Opt-in shared-key authentication for all timetable and raw-data routes."""
+    if API_ACCESS_KEY and request.url.path.startswith("/schedule"):
+        supplied = request.headers.get("X-API-Key", "")
+        if not hmac.compare_digest(supplied, API_ACCESS_KEY):
+            return JSONResponse(status_code=401, content={"detail": "Valid X-API-Key required."})
+    return await call_next(request)
 
 
 def _payload_container(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -65,11 +80,21 @@ def _same_semester(left: Any, right: Any) -> bool:
 
 
 def _write_json_atomic(path: Path, data: Dict[str, Any]) -> None:
+    """Use a unique temporary file so concurrent writes cannot overwrite one another."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    with temp.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
-    temp.replace(path)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            json.dump(data, handle, ensure_ascii=False)
+            handle.flush()
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
@@ -104,7 +129,7 @@ def _save_latest_input(payload: Dict[str, Any], source_hash: str, fetched_at: fl
         LATEST_INPUT_FILE,
         {
             "source": {
-                "backendUrl": BACKEND_AI_DATA_URL,
+                "backendConfigured": bool(BACKEND_AI_DATA_URL),
                 "fetchedAt": round(fetched_at, 3),
                 "semesterId": _payload_semester_id(payload),
                 "dataHash": source_hash,
@@ -270,6 +295,7 @@ def _create_job(payload: Dict[str, Any], fetch_seconds: float) -> Dict[str, Any]
             "sourceSemesterId": source_semester_id,
             "sourceDataHash": source_hash,
         }
+    _prune_completed_jobs()
 
     return {
         "jobId": job_id,
@@ -283,7 +309,18 @@ def _create_job(payload: Dict[str, Any], fetch_seconds: float) -> Dict[str, Any]
     }
 
 
+def _prune_completed_jobs() -> None:
+    """Retain a bounded number of completed Futures (which hold schedule results)."""
+    with jobs_lock:
+        completed = [
+            job_id for job_id, job in jobs.items() if job["future"].done()
+        ]
+        for job_id in completed[:-MAX_COMPLETED_JOBS]:
+            del jobs[job_id]
+
+
 def _running_job_summary() -> Dict[str, Any]:
+    _prune_completed_jobs()
     with jobs_lock:
         items = list(jobs.items())
     for job_id, job in reversed(items):
@@ -327,13 +364,18 @@ def _active_generation_status() -> Dict[str, Any]:
 def _start_backend_schedule_job() -> Dict[str, Any]:
     if not BACKEND_AI_DATA_URL:
         raise HTTPException(status_code=503, detail="Backend source not configured. Set BACKEND_AI_DATA_URL to an authorized data endpoint.")
-    running = _running_job_summary()
-    if running:
-        return running
-    started = time.perf_counter()
-    payload = load_json_from_url(BACKEND_AI_DATA_URL, timeout=BACKEND_FETCH_TIMEOUT_SECONDS, no_cache=True)
-    fetch_seconds = time.perf_counter() - started
-    return _create_job(payload, fetch_seconds)
+    # Keep the check, backend fetch and job registration as one operation.
+    # Without this lock, simultaneous refresh requests can queue duplicate jobs.
+    with job_start_lock:
+        running = _running_job_summary()
+        if running:
+            return running
+        started = time.perf_counter()
+        payload = load_json_from_url(
+            BACKEND_AI_DATA_URL, timeout=BACKEND_FETCH_TIMEOUT_SECONDS, no_cache=True
+        )
+        fetch_seconds = time.perf_counter() - started
+        return _create_job(payload, fetch_seconds)
 
 
 @app.get("/")

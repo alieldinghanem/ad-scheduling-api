@@ -127,6 +127,18 @@ python main.py sample_data/demo_academic_input.json output_schedule.json
 
 > Backend-driven generation requires an accessible, authorized external data source configured via `BACKEND_AI_DATA_URL`. Its availability is not required to inspect the code or run synthetic direct-input tests.
 
+### Optional API authentication and operational safety
+
+For any deployment that processes confidential academic data, configure a strong random `ADEX_API_KEY` as a **private environment variable**, and send it with every timetable request:
+
+```bash
+curl -H "X-API-Key: your-configured-secret" http://127.0.0.1:8000/schedule/status
+```
+
+All `/schedule*` routes require this key **when configured**; `/health` stays public for readiness checks. The key is **optional** to keep synthetic local demos easy to run; **without it, real-data routes are open**. A shared API key is a basic access gate, not user-based authentication, role-based authorization, rate limiting, or audit logging. Do not publicly expose a real-data deployment without a full security review.
+
+Job status retains at most `MAX_COMPLETED_JOBS=8` completed jobs in memory (in addition to active work). Concurrent backend refresh attempts are serialized to avoid duplicate schedule generation. Saved input snapshots record whether a backend is configured but do not record its full URL or query string. JSON snapshots use unique temporary files to avoid simultaneous-writer collisions. `SCHEDULER_TIMEOUT_SECONDS` is currently **status metadata only**, not an enforced computation cutoff.
+
 ## Testing
 
 ```bash
@@ -134,7 +146,7 @@ python -m pip install -r requirements-dev.txt
 python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-The automated suite includes smoke tests, scheduling against a non-empty synthetic dataset, basic conflict and unscheduled-session assertions, API route validation, stored-result retrieval, and a mocked background-job workflow. GitHub Actions runs these tests and Python compilation checks.
+The automated suite includes smoke tests, scheduling against a non-empty synthetic dataset, conflict and unscheduled-session assertions, API route validation, stored-result retrieval, mocked background jobs, concurrent file writing, optional API-key protection, and retention/refresh regression tests. GitHub Actions runs these tests and Python compilation checks.
 
 **Scope of verification:** The current synthetic suite is a reproducible demonstration, not proof that every possible university timetable or edge case is conflict-free. Real-world academic testing, operational use, and the Excellent (Grade A) evaluation are reported by the project author.
 

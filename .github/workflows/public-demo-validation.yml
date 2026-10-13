@@ -4,10 +4,12 @@ on:
   push:
     branches:
       - release/public-clean-root
+      - improve/api-safety-reliability-20261013
       - main
   pull_request:
     branches:
       - main
+      - release/public-clean-root
   workflow_dispatch:
 
 permissions:
