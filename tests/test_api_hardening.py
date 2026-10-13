@@ -1,6 +1,7 @@
 """Focused reliability and opt-in security regressions; no institutional data."""
 import json
 import tempfile
+import time
 import unittest
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -60,6 +61,33 @@ class APIHardeningTests(unittest.TestCase):
             self.assertTrue(snapshot["source"]["backendConfigured"])
             self.assertNotIn("backendUrl", snapshot["source"])
             self.assertNotIn("keep-private", json.dumps(snapshot))
+
+    def test_simultaneous_backend_refresh_starts_one_job(self):
+        payload = {"semesterId": 999, "regularCourses": []}
+
+        def slow_scheduler(data):
+            time.sleep(0.25)
+            return {"success": True, "metadata": {"semesterId": 999}, "totalSessions": 0}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with (
+                patch.object(api, "BACKEND_AI_DATA_URL", "https://example.invalid/synthetic"),
+                patch.object(api, "LATEST_INPUT_FILE", root / "input.json"),
+                patch.object(api, "LATEST_SCHEDULE_FILE", root / "result.json"),
+                patch.object(api, "GENERATION_STATUS_FILE", root / "status.json"),
+                patch.object(api, "load_json_from_url", return_value=payload) as fetch,
+                patch.object(api, "run_scheduler", side_effect=slow_scheduler),
+            ):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    futures = [executor.submit(api._start_backend_schedule_job) for _ in range(2)]
+                    results = [future.result(timeout=10) for future in futures]
+                self.assertEqual(results[0]["jobId"], results[1]["jobId"])
+                self.assertEqual(fetch.call_count, 1)
+                job_id = results[0]["jobId"]
+                api.jobs[job_id]["future"].result(timeout=10)
+                with api.jobs_lock:
+                    api.jobs.pop(job_id, None)
 
     def test_finished_future_registry_bounded_without_dropping_running_jobs(self):
         original_jobs = {}
