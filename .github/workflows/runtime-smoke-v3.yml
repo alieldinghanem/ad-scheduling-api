@@ -21,7 +21,8 @@ jobs:
       - name: Compile
         run: python -m py_compile api.py main.py scheduler.py scheduler_performance.py sitecustomize.py
       - name: Import API
-        run: python - <<'PY'
+        run: |
+          python - <<'PY'
           import api
           assert api.SCHEDULE_OUTPUT_VERSION == '20260910-render-low-memory-v3'
           print('api import ok')
