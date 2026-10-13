@@ -409,6 +409,8 @@ def generate_schedule_from_backend(refresh: bool = False) -> Dict[str, Any]:
     if refresh:
         try:
             return _start_backend_schedule_job()
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
