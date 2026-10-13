@@ -23,7 +23,7 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install -r requirements-dev.txt
       - name: Compile
-        run: python -m compileall -q api.py main.py scheduler.py scheduler_performance.py aptech_ara.py tests
+        run: python -m compileall -q api.py main.py scheduler.py scheduler_performance.py aptech_ara.py tests scripts
       - name: Check API startup and health
         run: |
           python - <<'PY'
