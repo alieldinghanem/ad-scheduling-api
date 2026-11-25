@@ -4,7 +4,15 @@
 
 ADEX is a university academic scheduling backend that builds lecture, section, and laboratory timetables from structured academic data. Instead of relying on manual timetable assignment, the system applies academic scheduling rules, allocates available resources, and reports conflicts or sessions that could not be scheduled.
 
-Developed as **my graduation project**, ADEX received an **Excellent (Grade A)** evaluation. It was **successfully tested with real university academic scheduling data** and has been **used for actual timetable-generation workflows**, rather than being limited to a classroom prototype. The scheduling implementation remains in use, as reported by the project author.
+## Production and portfolio editions
+
+**Production.** The original ADEX system is deployed and currently in use for university timetable generation, as confirmed by the project author. The live installation and its academic records are available through the university's authorized environment.
+
+**Portfolio.** The standalone portfolio edition showcases the scheduling engine using fictional courses, instructors, rooms, and enrollment counts. Its demo input contains no real university records.
+
+> This repository is the legacy source repository. Its historical commits require a separate privacy review. Use the standalone portfolio edition for public sharing.
+
+Developed as **my graduation project**, ADEX received an **Excellent (Grade A)** evaluation.
 
 The system was built for a university-scale scenario involving **2,000+ students**, courses, teaching staff, rooms, and student groups. These figures describe the original project scenario, not a benchmark for the included synthetic input.
 
