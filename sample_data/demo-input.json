@@ -1,0 +1,141 @@
+{
+  "semesterId": "DEMO",
+  "days": [
+    "Saturday",
+    "Sunday",
+    "Monday",
+    "Tuesday"
+  ],
+  "regularTimeSlots": [
+    "09:00-11:00",
+    "11:00-13:00",
+    "13:00-15:00",
+    "15:00-17:00"
+  ],
+  "targetGroupSize": 45,
+  "sectionCapacity": 24,
+  "regularCourses": [
+    {
+      "courseCode": "DEMO101",
+      "courseName": "Demo Computing",
+      "level": 1,
+      "levels": [
+        1
+      ],
+      "enrollmentCount": 42,
+      "totalStudentCount": 42,
+      "labType": "LAB_ONLY",
+      "instructorIds": [
+        101,
+        102
+      ],
+      "departments": []
+    },
+    {
+      "courseCode": "DEMO102",
+      "courseName": "Demo Mathematics",
+      "level": 1,
+      "levels": [
+        1
+      ],
+      "enrollmentCount": 42,
+      "totalStudentCount": 42,
+      "labType": null,
+      "instructorIds": [
+        101
+      ],
+      "departments": []
+    }
+  ],
+  "regularInstructors": [
+    {
+      "instructorId": 101,
+      "name": "Demo Instructor 1",
+      "instructorType": "DOCTOR",
+      "assignedCourses": [
+        "DEMO101",
+        "DEMO102"
+      ],
+      "availabilities": [
+        {
+          "dayOfWeek": "Saturday",
+          "startTime": "09:00",
+          "endTime": "17:00",
+          "isAvailable": true
+        },
+        {
+          "dayOfWeek": "Sunday",
+          "startTime": "09:00",
+          "endTime": "17:00",
+          "isAvailable": true
+        },
+        {
+          "dayOfWeek": "Monday",
+          "startTime": "09:00",
+          "endTime": "17:00",
+          "isAvailable": true
+        },
+        {
+          "dayOfWeek": "Tuesday",
+          "startTime": "09:00",
+          "endTime": "17:00",
+          "isAvailable": true
+        }
+      ]
+    },
+    {
+      "instructorId": 102,
+      "name": "Demo Instructor 2",
+      "instructorType": "TA",
+      "assignedCourses": [
+        "DEMO101"
+      ],
+      "availabilities": [
+        {
+          "dayOfWeek": "Saturday",
+          "startTime": "09:00",
+          "endTime": "17:00",
+          "isAvailable": true
+        },
+        {
+          "dayOfWeek": "Sunday",
+          "startTime": "09:00",
+          "endTime": "17:00",
+          "isAvailable": true
+        },
+        {
+          "dayOfWeek": "Monday",
+          "startTime": "09:00",
+          "endTime": "17:00",
+          "isAvailable": true
+        },
+        {
+          "dayOfWeek": "Tuesday",
+          "startTime": "09:00",
+          "endTime": "17:00",
+          "isAvailable": true
+        }
+      ]
+    }
+  ],
+  "rooms": [
+    {
+      "roomId": 1,
+      "roomNumber": "DEMO-HALL",
+      "roomType": "GENERAL",
+      "capacity": 150
+    },
+    {
+      "roomId": 2,
+      "roomNumber": "DEMO-LAB-A",
+      "roomType": "LAB_ONLY",
+      "capacity": 150
+    },
+    {
+      "roomId": 3,
+      "roomNumber": "DEMO-LAB-B",
+      "roomType": "LAB_ONLY",
+      "capacity": 150
+    }
+  ]
+}
