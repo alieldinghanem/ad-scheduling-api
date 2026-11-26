@@ -29,6 +29,12 @@ The example generates two lectures and two practical sections for a fictional co
 
 Open `demo-output.json` and check for `success: true` and `totalSessions: 4`.
 
+## Stack and requirements
+
+- Python 3.12
+- FastAPI 0.115.12 and Uvicorn 0.34.2, pinned in [requirements.txt](requirements.txt)
+- The command-line demo uses the Python standard library. Install the pinned packages to run the HTTP API.
+
 ## Run the API locally
 
 Use Python 3.12. From the root of a local copy, install dependencies and start FastAPI:
@@ -39,6 +45,10 @@ python -m uvicorn api:app --host 127.0.0.1 --port 8000
 ```
 
 Open [Swagger UI](http://127.0.0.1:8000/docs) and submit the synthetic JSON to `POST /schedule`. The direct-input demo runs independently of the university backend.
+
+## Environment variables
+
+The local synthetic CLI and `POST /schedule` demo require no environment variables or credentials. `BACKEND_AI_DATA_URL` is for a separate authorized backend integration. See [.env.example](.env.example) for the configuration shape. Use only the local synthetic input when evaluating this demo.
 
 ## Implementation and testing
 
