@@ -6,9 +6,13 @@ ADEX generates university timetables from course demand, instructor and teaching
 
 ## My contribution
 
-I developed the **Python scheduling engine** and integrated it with the university platform's **.NET backend** through JSON. My work covered receiving enrollment, instructor, teaching assistant, and room data, assigning lectures and practical sections, and checking the resulting timetable for scheduling conflicts.
+I developed the **Python scheduling engine** and integrated it with the **.NET backend**. The backend supplied JSON with student enrollment, instructors, teaching assistants, classroom capacity, and availability. I wrote the scheduling logic that turned those inputs into a university-wide timetable by assigning lectures and practical sections to rooms and time slots. The engine checks for conflicts and reports sessions it could not place.
 
-The production project used university data covering **42 courses, 102 instructors, 80 rooms, and more than 2,000 students**. These figures describe the original project scope.
+## Project results
+
+The original ADEX system is **running in production and used to generate university timetables**. It automates session placement and conflict checks, and gives scheduling staff a structured timetable and a list of unresolved sessions to review.
+
+The production project used university data covering **42 courses, 102 instructors, 80 rooms, and 2,000+ students**. The team received an **Excellent** grade for the graduation project.
 
 ## Try the synthetic demo
 
